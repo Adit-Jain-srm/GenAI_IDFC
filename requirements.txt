@@ -1,0 +1,29 @@
+# Document AI - Invoice Field Extraction
+# Convolve 4.0 - Pan-IIT AI/ML Hackathon @ IIT Guwahati
+
+# Core Dependencies
+numpy>=1.24.0
+Pillow>=10.0.0
+loguru>=0.7.0
+
+# PDF Processing
+pdf2image>=1.16.3
+PyMuPDF>=1.23.0
+
+# OCR
+paddlepaddle>=2.5.0
+paddleocr>=2.7.0
+
+# Object Detection
+ultralytics>=8.1.0
+opencv-python>=4.8.0
+
+# Text Matching
+rapidfuzz>=3.5.0
+
+# VLM (Optional - for enhanced extraction)
+openai>=1.0.0
+# transformers>=4.36.0  # Uncomment for local Qwen
+
+# Data Processing
+pandas>=2.0.0
