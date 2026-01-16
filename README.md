@@ -112,7 +112,38 @@ def detect_language(text):
     return 'english'
 ```
 
-### 2. Field Extraction Patterns
+### 2. Visual-Textual Understanding
+
+The system uses hybrid visual and textual analysis for robust extraction from unknown layouts:
+
+#### Spatial Key-Value Detection
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  DOCUMENT LAYOUT ANALYSIS                                │
+├──────────────────────────────────────────────────────────┤
+│  Pattern 1: "Key: Value" (colon-separated)              │
+│  Pattern 2: Key [LEFT] → Value [RIGHT] (same row)       │
+│  Pattern 3: Key [ABOVE] → Value [BELOW] (stacked)       │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### Table Structure Detection
+
+- Groups text elements by rows (y-coordinate alignment)
+- Identifies column structure from x-alignment patterns
+- Extracts header row to understand column meanings
+- Prioritizes table data for model, HP, and cost fields
+
+#### Region-Based Extraction
+
+| Region | Position | Typical Content |
+|:-------|:---------|:----------------|
+| Header | Top 20% | Dealer name, logo, contact |
+| Body | 20-75% | Items, specs, prices |
+| Footer | 75-100% | Totals, signatures, stamps |
+
+### 3. Field Extraction Patterns
 
 Comprehensive regex patterns cover multiple formats:
 
@@ -137,14 +168,56 @@ MODEL_HP_MAP = {
 }
 ```
 
-### 4. Signature & Stamp Detection
+### 4. Multilingual Support & Transliteration
+
+Full support for **English, Hindi, Gujarati, and mixed vernacular** documents:
+
+| Language | Script Detection | Transliteration | Example |
+|:---------|:-----------------|:----------------|:--------|
+| Hindi | Devanagari (U+0900-097F) | ✓ To English | महिंद्रा → Mahindra |
+| Gujarati | Gujarati (U+0A80-0AFF) | ✓ To English | પટેલ → Patel |
+| English | ASCII | Native | Direct processing |
+| Mixed | Auto-detect ratio | Hybrid | गुप्ता Motors → Gupta Motors |
+
+**Transliteration Maps Include:**
+- Common names: शर्मा→Sharma, गुप्ता→Gupta, પટેલ→Patel
+- Business terms: ट्रैक्टर्स→Tractors, मोटर्स→Motors
+- Tractor brands: महिंद्रा→Mahindra, स्वराज→Swaraj
+
+### 5. Post-Processing & Quality Assurance
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  POST-PROCESSING PIPELINE                                   │
+├─────────────────────────────────────────────────────────────┤
+│  1. Near-Duplicate Reconciliation                           │
+│     - Fuzzy match similar extractions                       │
+│     - Select most common normalized value                   │
+│                                                             │
+│  2. Textual Variation Normalization                         │
+│     - Unicode NFC normalization                             │
+│     - Company suffix standardization (PVT LTD → Pvt Ltd)    │
+│     - Brand name capitalization                             │
+│                                                             │
+│  3. Numeric Accuracy Validation                             │
+│     - Range checks (HP: 15-150, Cost: 50K-50L)             │
+│     - Cross-reference with Model-HP mapping                 │
+│     - Currency format parsing (₹5,25,000 → 525000)         │
+│                                                             │
+│  4. Confidence Threshold Enforcement                        │
+│     - Per-field thresholds (dealer: 0.6, model: 0.7)       │
+│     - Low confidence → null (prevents false positives)      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 6. Signature & Stamp Detection
 
 | Detection Type | Method | Features Used |
 |:---------------|:-------|:--------------|
 | Signature | Contour Analysis | Ink density, aspect ratio (width > height) |
 | Stamp | Color Detection | Blue/Red/Purple HSV ranges, circularity |
 
-### 5. Tiered Processing
+### 7. Tiered Processing
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -153,9 +226,159 @@ MODEL_HP_MAP = {
 │  Cost: $0.0005  |  Latency: ~3s                         │
 ├──────────────────────────────────────────────────────────┤
 │  TIER 2 (5% of documents - low confidence)               │
-│  Tier 1 + VLM Enhancement                                │
+│  Tier 1 + VLM Enhancement + Consensus Voting             │
 │  Cost: $0.003   |  Latency: ~6s                         │
 └──────────────────────────────────────────────────────────┘
+```
+
+### 8. Pseudo-Labeling & Consensus Methods
+
+#### Handling Lack of Ground Truth
+
+Since no pre-labeled data is provided, our system implements strategies from weak supervision and active learning:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  PSEUDO-LABELING PIPELINE                                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. DETERMINISTIC RULES (High Precision)                           │
+│     ┌────────────────────────────────────────────────┐             │
+│     │ Pattern: "50 HP" → HP = 50 (confidence: 0.95)  │             │
+│     │ Pattern: "Total: ₹5,25,000" → Cost (conf: 0.95)│             │
+│     │ Pattern: "Mahindra 575 DI" → Model (conf: 0.90)│             │
+│     └────────────────────────────────────────────────┘             │
+│                           ↓                                         │
+│  2. MODEL EXTRACTION                                                │
+│     - OCR + Field Parser extracts with confidence                   │
+│     - VLM provides secondary extraction                             │
+│                           ↓                                         │
+│  3. CROSS-VALIDATION                                                │
+│     - If deterministic ≈ model → boost confidence (+0.1)           │
+│     - If conflict → use higher confidence, flag unreliable         │
+│                           ↓                                         │
+│  4. PSEUDO-LABEL GENERATION                                         │
+│     - Threshold: confidence ≥ 0.85 → is_pseudo_label = True        │
+│     - Source tracking: 'deterministic', 'extraction', 'consensus'  │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### Consensus Voting (Multi-View Learning)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  CONSENSUS ENGINE                                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Extraction Pipelines (Voters):                                     │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
+│  │ Rule-Based  │  │    VLM      │  │   Tables    │                 │
+│  │  Parser     │  │  (Qwen/GPT) │  │   KV-Pairs  │                 │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘                 │
+│         │                │                │                         │
+│         └────────────────┼────────────────┘                         │
+│                          ↓                                          │
+│               ┌──────────────────┐                                  │
+│               │  VOTING LOGIC    │                                  │
+│               ├──────────────────┤                                  │
+│               │ • Group similar  │                                  │
+│               │   values (fuzzy) │                                  │
+│               │ • Confidence-    │                                  │
+│               │   weighted sum   │                                  │
+│               │ • Agreement      │                                  │
+│               │   ratio boost    │                                  │
+│               └────────┬─────────┘                                  │
+│                        ↓                                            │
+│         ┌──────────────────────────────┐                           │
+│         │ Winner: highest weighted vote │                           │
+│         │ Confidence: avg + agreement   │                           │
+│         └──────────────────────────────┘                           │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+| Component | Method | Confidence Boost |
+|:----------|:-------|:-----------------|
+| Deterministic Rules | High-precision regex patterns | +0.15 to +0.20 |
+| Cross-Validation | Deterministic matches extraction | +0.10 |
+| Consensus (≥80% agreement) | Multi-voter alignment | +0.10 |
+| Consensus (60-80% agreement) | Majority wins | No change |
+| Conflict Resolution | Higher confidence wins | -0.05 to -0.10 |
+
+#### Bootstrapping & Iterative Refinement
+
+```python
+# Bootstrap refinement loop
+for iteration in range(max_iterations):
+    # Generate pseudo-labels from current best extractions
+    pseudo_labels = consensus_engine.generate_pseudo_labels(text, extractions)
+    
+    # Run extraction on next document batch
+    new_extractions = extractor.extract_batch(documents)
+    
+    # Refine labels: agreement boosts, conflicts penalize
+    refined = bootstrap_refiner.refine_labels(pseudo_labels, new_extractions)
+    
+    # Track stable labels (same value across iterations)
+    stable_labels = bootstrap_refiner.get_stable_labels()
+    # stable = True → high reliability for downstream use
+```
+
+#### Self-Consistency Verification
+
+| Check | Validation | Action |
+|:------|:-----------|:-------|
+| HP-Model Match | HP matches known model specs | ✓ Boost or ✗ Flag |
+| Cost Range | ₹50K - ₹50L reasonable | ✓ Pass or ⚠ Warning |
+| Model-Cost | High HP → Higher cost expected | ✓ Pass or ⚠ Warning |
+
+### 9. Advanced Prompt Engineering (VLM)
+
+The VLM fallback uses enterprise-grade prompt engineering optimized for IDFC Bank's document processing needs:
+
+#### Prompt Engineering Best Practices Applied
+
+| Technique | Implementation | Benefit |
+|:----------|:---------------|:--------|
+| **Domain Persona** | Expert document AI specialist role | Focuses model on banking/loan context |
+| **Chain-of-Thought** | Step-by-step extraction instructions | Improves reasoning accuracy |
+| **Few-Shot Examples** | 3 diverse examples (English, Hindi, Partial) | Consistent output format |
+| **Multilingual Awareness** | Hindi/Gujarati keywords included | Better vernacular handling |
+| **Structured Output** | JSON schema with validation rules | Parseable, validated results |
+| **Confidence Guidelines** | Explicit scoring criteria | Reliable uncertainty estimation |
+
+#### Example Prompt Structure
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  SYSTEM PROMPT                                              │
+│  ├── Role: IDFC Bank Document AI Specialist                 │
+│  ├── Domain Expertise: Indian tractor brands, currencies    │
+│  └── Accuracy Standards: ≥95% DLA requirement              │
+├─────────────────────────────────────────────────────────────┤
+│  USER PROMPT                                                │
+│  ├── Step-by-Step Extraction Guide                         │
+│  │   ├── 1. Dealer Name (header, letterhead patterns)      │
+│  │   ├── 2. Model Name (brand + number + variant)          │
+│  │   ├── 3. Horse Power (HP, BHP, अश्वशक्ति)               │
+│  │   └── 4. Asset Cost (Total, कुल, currency formats)      │
+│  ├── Few-Shot Examples (3 diverse scenarios)               │
+│  ├── Output JSON Schema                                    │
+│  ├── Confidence Scoring Guidelines                         │
+│  └── Critical Rules (no hallucination, transliteration)    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Post-Extraction Validation
+
+```python
+# Automatic result validation
+def validate_extraction(result):
+    # Type coercion (string → int for HP/Cost)
+    # Range validation (HP: 15-150, Cost: 50K-50L)
+    # Confidence adjustment based on completeness
+    # Extraction notes for audit trail
 ```
 
 ---

@@ -13,6 +13,7 @@ from .vlm_extractor import VLMExtractor
 from .yolo_detector import YOLODetector
 from .field_parser import FieldParser
 from .validator import Validator
+from .consensus_engine import ConsensusEngine, BootstrapRefiner
 
 __all__ = [
     "DocumentProcessor",
@@ -20,5 +21,7 @@ __all__ = [
     "VLMExtractor",
     "YOLODetector",
     "FieldParser",
-    "Validator"
+    "Validator",
+    "ConsensusEngine",
+    "BootstrapRefiner"
 ]

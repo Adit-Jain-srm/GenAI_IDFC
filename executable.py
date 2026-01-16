@@ -17,7 +17,7 @@ import json
 import time
 import argparse
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from loguru import logger
 
@@ -27,6 +27,7 @@ from utils.ocr_engine import OCREngine
 from utils.field_parser import FieldParser
 from utils.validator import Validator
 from utils.yolo_detector import YOLODetector
+from utils.consensus_engine import ConsensusEngine, BootstrapRefiner
 
 
 class InvoiceExtractor:
@@ -94,6 +95,14 @@ class InvoiceExtractor:
         self.vlm_provider = vlm_provider
         self._vlm = None
         
+        # Consensus Engine for multi-pipeline extraction
+        self.consensus_engine = ConsensusEngine(
+            min_voters=2,
+            confidence_weight=True,
+            use_deterministic_boost=True
+        )
+        self.bootstrap_refiner = BootstrapRefiner(self.consensus_engine)
+        
         logger.info("Invoice Extractor initialized successfully")
     
     def _get_vlm(self):
@@ -140,38 +149,109 @@ class InvoiceExtractor:
             image, metadata = pages[0]  # Use first page
             img_size = image.size  # (width, height)
             
-            # === STAGE 2: OCR Extraction ===
-            ocr_result = {'texts': [], 'boxes': [], 'full_text': '', 'language': 'english'}
+            # === STAGE 2: OCR Extraction with Layout Analysis ===
+            ocr_result = {
+                'texts': [], 'boxes': [], 'full_text': '', 'language': 'english',
+                'lines': [], 'regions': {}, 'key_value_candidates': [], 'tables': []
+            }
             
             if self._ocr_available:
-                ocr_result = self.ocr_engine.extract_text(image)
+                # Use enhanced layout extraction for better visual understanding
+                ocr_result = self.ocr_engine.extract_with_layout(image)
                 processing_stats['ocr_calls'] = 1
+                
                 logger.debug(f"OCR extracted {len(ocr_result.get('texts', []))} text elements")
                 logger.debug(f"Detected language: {ocr_result.get('language', 'unknown')}")
+                logger.debug(f"Detected {len(ocr_result.get('lines', []))} lines, "
+                           f"{len(ocr_result.get('tables', []))} tables, "
+                           f"{len(ocr_result.get('key_value_candidates', []))} KV pairs")
             
-            # === STAGE 3: Field Parsing ===
+            # === STAGE 3: Multi-Pipeline Extraction with Consensus ===
+            # Define extraction methods for consensus voting
+            extraction_methods = [
+                lambda: self.field_parser.extract_all(ocr_result),  # Method 1: Full parser
+            ]
+            method_names = ['rule_based']
+            
+            # Add VLM as additional voter if enabled
+            vlm_result = None
+            if self.use_vlm:
+                vlm = self._get_vlm()
+                if vlm:
+                    def vlm_extraction():
+                        nonlocal vlm_result
+                        try:
+                            vlm_result = vlm.extract_fields(image)
+                            processing_stats['vlm_calls'] = 1
+                            processing_stats['vlm_tokens'] = getattr(vlm, 'tokens_used', 500)
+                            return vlm_result
+                        except Exception as e:
+                            logger.warning(f"VLM extraction failed: {e}")
+                            return {}
+                    
+                    extraction_methods.append(vlm_extraction)
+                    method_names.append('vlm')
+            
+            # Run primary extraction
             parsed_fields = self.field_parser.extract_all(ocr_result)
-            
-            # Calculate initial confidence
             initial_confidence = self._calculate_confidence(parsed_fields)
             logger.debug(f"Initial extraction confidence: {initial_confidence:.2f}")
             
-            # === STAGE 4: VLM Enhancement (if enabled and confidence low) ===
-            if self.use_vlm and initial_confidence < 0.75:
-                vlm = self._get_vlm()
-                if vlm:
-                    logger.info("Confidence low, using VLM enhancement...")
-                    try:
-                        vlm_result = vlm.extract_fields(image)
-                        processing_stats['vlm_calls'] = 1
-                        processing_stats['vlm_tokens'] = getattr(vlm, 'tokens_used', 500)
-                        
-                        # Merge VLM results
-                        parsed_fields = self._merge_vlm_results(parsed_fields, vlm_result)
-                    except Exception as e:
-                        logger.warning(f"VLM extraction failed: {e}")
+            # === STAGE 4: Consensus & Pseudo-Labeling ===
+            # Generate pseudo-labels using deterministic rules
+            full_text = ocr_result.get('full_text', '')
+            pseudo_labels = self.consensus_engine.generate_pseudo_labels(
+                ocr_text=full_text,
+                extraction_results=parsed_fields,
+                full_ocr_result=ocr_result
+            )
+            logger.debug(f"Generated pseudo-labels for {sum(1 for p in pseudo_labels.values() if p.get('is_pseudo_label'))} fields")
             
-            # === STAGE 5: Validation ===
+            # If confidence is low, use VLM and apply consensus
+            if initial_confidence < 0.75 and self.use_vlm and len(extraction_methods) > 1:
+                logger.info("Low confidence - applying consensus voting...")
+                
+                # Run consensus across methods
+                consensus_results = self.consensus_engine.extract_with_consensus(
+                    extraction_methods, method_names
+                )
+                
+                # Convert consensus to parsed_fields format
+                for field, (value, conf, meta) in consensus_results.items():
+                    if value is not None and conf > 0:
+                        parsed_fields[field] = (value, conf)
+                        logger.debug(f"  {field}: {value} (conf={conf:.2f}, voters={meta.get('voters', 1)})")
+                
+                processing_stats['consensus_voters'] = len(extraction_methods)
+            
+            # Bootstrap refinement with pseudo-labels
+            refined_labels = self.bootstrap_refiner.refine_labels(
+                current_labels=pseudo_labels,
+                new_extraction=parsed_fields
+            )
+            
+            # Use refined labels if they're more reliable
+            for field, label in refined_labels.items():
+                _, current_conf = self._safe_unpack_field(parsed_fields.get(field), 0.0)
+                
+                if label.get('reliable') and label.get('confidence', 0) > current_conf:
+                    parsed_fields[field] = (label['value'], label['confidence'])
+            
+            # === STAGE 5: Self-Consistency Verification ===
+            consistency_report = self.consensus_engine.verify_self_consistency(
+                {k: (v[0] if isinstance(v, tuple) else v, v[1] if isinstance(v, tuple) else 0.5, {}) 
+                 for k, v in parsed_fields.items()}
+            )
+            
+            if not consistency_report['is_consistent']:
+                logger.warning("Self-consistency check failed, applying adjustments...")
+                for field, adj in consistency_report.get('adjustments', {}).items():
+                    if field in parsed_fields:
+                        val, conf = self._safe_unpack_field(parsed_fields[field], 0.5)
+                        # Lower confidence for inconsistent fields
+                        parsed_fields[field] = (val, conf * 0.85)
+            
+            # === STAGE 6: Validation ===
             validated = self.validator.validate_all(parsed_fields)
             
             # === STAGE 6: Signature/Stamp Detection ===
@@ -203,12 +283,36 @@ class InvoiceExtractor:
             
             return self._error_result(doc_id, str(e), time.time() - start_time)
     
+    @staticmethod
+    def _safe_unpack_field(field_value, default_conf: float = 0.0) -> Tuple:
+        """
+        Safely unpack field value to (value, confidence) tuple.
+        
+        Handles edge cases where field_value might be:
+        - A proper (value, confidence) tuple
+        - A single-element tuple
+        - A raw value (not a tuple)
+        - None
+        """
+        if field_value is None:
+            return (None, default_conf)
+        elif isinstance(field_value, tuple):
+            if len(field_value) >= 2:
+                return (field_value[0], field_value[1])
+            elif len(field_value) == 1:
+                return (field_value[0], default_conf)
+            else:
+                return (None, default_conf)
+        else:
+            return (field_value, default_conf)
+    
     def _calculate_confidence(self, fields: Dict) -> float:
         """Calculate extraction confidence from parsed fields."""
         confidences = []
         for value in fields.values():
-            if isinstance(value, tuple) and len(value) == 2:
-                confidences.append(value[1])
+            _, conf = self._safe_unpack_field(value, 0.0)
+            if conf > 0:
+                confidences.append(conf)
         return sum(confidences) / len(confidences) if confidences else 0.0
     
     def _merge_vlm_results(self, parsed: Dict, vlm: Dict) -> Dict:
@@ -217,7 +321,7 @@ class InvoiceExtractor:
         vlm_conf = vlm.get('confidence', 0.8)
         
         for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
-            parsed_val, parsed_conf = parsed.get(field, (None, 0))
+            parsed_val, parsed_conf = self._safe_unpack_field(parsed.get(field), 0.0)
             vlm_val = vlm.get(field)
             
             # Use VLM if OCR confidence is low or OCR didn't find value
@@ -243,13 +347,19 @@ class InvoiceExtractor:
         sig = detections.get('signature', {})
         stamp = detections.get('stamp', {})
         
-        # Calculate overall confidence
+        # Get per-field confidences computed by validator
+        # These are based on fuzzy matching, cross-validation, and range checking
+        field_confs = validated.get('_field_confidences', {})
+        
+        # Calculate overall confidence using actual field-level confidences
         field_confidences = []
         
-        # Text/numeric fields
+        # Text/numeric fields - use actual computed confidences, not hardcoded values
         for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
             if validated.get(field) is not None:
-                field_confidences.append(0.85)
+                # Use validator's computed confidence for this field
+                actual_conf = field_confs.get(field, 0.85)
+                field_confidences.append(actual_conf)
             else:
                 field_confidences.append(0.0)
         
@@ -257,10 +367,10 @@ class InvoiceExtractor:
         field_confidences.append(sig.get('confidence', 0))
         field_confidences.append(stamp.get('confidence', 0))
         
-        # Use validator's confidence if available
+        # Use validator's overall confidence if available, otherwise calculate from fields
         overall_confidence = validated.get('_confidence', 0)
         if overall_confidence == 0:
-            overall_confidence = sum(field_confidences) / len(field_confidences)
+            overall_confidence = sum(field_confidences) / len(field_confidences) if field_confidences else 0
         
         # Estimate cost
         cost = self._estimate_cost(processing_stats)

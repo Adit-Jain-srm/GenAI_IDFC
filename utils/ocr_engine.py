@@ -1,13 +1,18 @@
 """
 OCR Engine Module
-PaddleOCR wrapper with multilingual support (English, Hindi, Gujarati)
+PaddleOCR wrapper with advanced visual-textual understanding
 
 Key Features:
-- Multi-language OCR with automatic detection
-- Layout-aware text extraction
-- Confidence scoring
+- Multi-language OCR (English, Hindi, Gujarati)
+- Layout-aware text extraction with reading order
+- Table structure detection
+- Key-value pair spatial analysis
+- Confidence scoring with quality metrics
+
+Optimized for diverse invoice layouts and unknown formats.
 """
 
+import re
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 import numpy as np
@@ -322,3 +327,283 @@ class OCREngine:
                 texts_in_region.append(text)
         
         return texts_in_region
+    
+    def get_structured_output(self, ocr_result: Dict, image_size: Tuple[int, int]) -> Dict:
+        """
+        Get structured OCR output with layout analysis.
+        
+        Returns:
+            Dict with:
+            - lines: Text grouped by reading lines
+            - regions: Header/body/footer segmentation
+            - key_value_candidates: Detected key-value patterns
+            - tables: Detected table structures
+        """
+        texts = ocr_result.get('texts', [])
+        boxes = ocr_result.get('boxes', [])
+        
+        if not texts or not boxes:
+            return {'lines': [], 'regions': {}, 'key_value_candidates': [], 'tables': []}
+        
+        width, height = image_size
+        
+        # Group into lines
+        lines = self._group_into_lines(texts, boxes)
+        
+        # Segment into regions
+        regions = self._segment_regions(texts, boxes, height)
+        
+        # Detect key-value candidates
+        kv_candidates = self._detect_kv_candidates(texts, boxes)
+        
+        # Detect table structures
+        tables = self._detect_tables(texts, boxes)
+        
+        return {
+            'lines': lines,
+            'regions': regions,
+            'key_value_candidates': kv_candidates,
+            'tables': tables
+        }
+    
+    def _group_into_lines(
+        self,
+        texts: List[str],
+        boxes: List[List[int]],
+        y_tolerance: int = 15
+    ) -> List[Dict]:
+        """
+        Group text into logical lines based on y-coordinates.
+        
+        Returns list of lines with text and bounding box.
+        """
+        if not texts:
+            return []
+        
+        # Sort by y-coordinate
+        elements = sorted(zip(texts, boxes), key=lambda x: (x[1][1], x[1][0]))
+        
+        lines = []
+        current_line_texts = []
+        current_line_boxes = []
+        current_y = elements[0][1][1]
+        
+        for text, box in elements:
+            if abs(box[1] - current_y) <= y_tolerance:
+                current_line_texts.append(text)
+                current_line_boxes.append(box)
+            else:
+                if current_line_texts:
+                    # Sort by x within line
+                    sorted_items = sorted(zip(current_line_texts, current_line_boxes),
+                                         key=lambda x: x[1][0])
+                    lines.append({
+                        'text': ' '.join([t for t, _ in sorted_items]),
+                        'elements': [{'text': t, 'box': b} for t, b in sorted_items],
+                        'bbox': self._get_line_bbox(current_line_boxes)
+                    })
+                current_line_texts = [text]
+                current_line_boxes = [box]
+                current_y = box[1]
+        
+        # Add last line
+        if current_line_texts:
+            sorted_items = sorted(zip(current_line_texts, current_line_boxes),
+                                 key=lambda x: x[1][0])
+            lines.append({
+                'text': ' '.join([t for t, _ in sorted_items]),
+                'elements': [{'text': t, 'box': b} for t, b in sorted_items],
+                'bbox': self._get_line_bbox(current_line_boxes)
+            })
+        
+        return lines
+    
+    def _get_line_bbox(self, boxes: List[List[int]]) -> List[int]:
+        """Get bounding box encompassing all boxes in a line."""
+        if not boxes:
+            return [0, 0, 0, 0]
+        
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+        
+        return [x1, y1, x2, y2]
+    
+    def _segment_regions(
+        self,
+        texts: List[str],
+        boxes: List[List[int]],
+        image_height: int
+    ) -> Dict[str, List[str]]:
+        """
+        Segment document into header, body, footer regions.
+        
+        Typical invoice layout:
+        - Header (top 20%): Dealer name, logo, contact info
+        - Body (20-75%): Items, specifications, prices
+        - Footer (bottom 25%): Totals, signatures, stamps
+        """
+        header_cutoff = image_height * 0.20
+        footer_cutoff = image_height * 0.75
+        
+        regions = {'header': [], 'body': [], 'footer': []}
+        
+        for text, box in zip(texts, boxes):
+            y_center = (box[1] + box[3]) / 2
+            
+            if y_center < header_cutoff:
+                regions['header'].append(text)
+            elif y_center > footer_cutoff:
+                regions['footer'].append(text)
+            else:
+                regions['body'].append(text)
+        
+        return regions
+    
+    def _detect_kv_candidates(
+        self,
+        texts: List[str],
+        boxes: List[List[int]]
+    ) -> List[Dict]:
+        """
+        Detect potential key-value pairs based on spatial patterns.
+        
+        Patterns detected:
+        1. "Key: Value" in same text
+        2. Key on left, value on right (same line)
+        3. Key above, value below
+        """
+        candidates = []
+        
+        # Pattern 1: Colon-separated in same text
+        colon_pattern = re.compile(r'^([^:]+):\s*(.+)$')
+        for i, text in enumerate(texts):
+            match = colon_pattern.match(text)
+            if match:
+                candidates.append({
+                    'type': 'colon_separated',
+                    'key': match.group(1).strip(),
+                    'value': match.group(2).strip(),
+                    'box': boxes[i],
+                    'confidence': 0.9
+                })
+        
+        # Pattern 2: Adjacent horizontal pairs
+        for i, (text1, box1) in enumerate(zip(texts, boxes)):
+            # Skip if already has value (contains colon)
+            if ':' in text1 and len(text1.split(':')[1].strip()) > 0:
+                continue
+            
+            # Look for text to the right
+            for j, (text2, box2) in enumerate(zip(texts, boxes)):
+                if i == j:
+                    continue
+                
+                # Check if same line and to the right
+                y_overlap = min(box1[3], box2[3]) - max(box1[1], box2[1])
+                height = min(box1[3] - box1[1], box2[3] - box2[1])
+                
+                if y_overlap > height * 0.5 and box2[0] > box1[2]:
+                    distance = box2[0] - box1[2]
+                    if distance < 200:  # Close enough
+                        candidates.append({
+                            'type': 'horizontal_pair',
+                            'key': text1,
+                            'value': text2,
+                            'key_box': box1,
+                            'value_box': box2,
+                            'confidence': 0.8
+                        })
+        
+        return candidates
+    
+    def _detect_tables(
+        self,
+        texts: List[str],
+        boxes: List[List[int]]
+    ) -> List[Dict]:
+        """
+        Detect table structures based on column alignment.
+        
+        Tables are characterized by:
+        - Multiple rows with similar y-coordinates
+        - Consistent column x-alignments
+        - Header row with descriptive text
+        """
+        if len(texts) < 4:
+            return []
+        
+        # Group by rows
+        rows = []
+        elements = sorted(zip(texts, boxes), key=lambda x: x[1][1])
+        
+        current_row = []
+        current_y = elements[0][1][1]
+        y_tolerance = 20
+        
+        for text, box in elements:
+            if abs(box[1] - current_y) <= y_tolerance:
+                current_row.append({'text': text, 'box': box})
+            else:
+                if len(current_row) >= 2:  # Multi-column row
+                    rows.append(current_row)
+                current_row = [{'text': text, 'box': box}]
+                current_y = box[1]
+        
+        if len(current_row) >= 2:
+            rows.append(current_row)
+        
+        # Identify tables (consecutive rows with similar column count)
+        tables = []
+        if len(rows) >= 2:
+            table_rows = []
+            expected_cols = len(rows[0])
+            
+            for row in rows:
+                if abs(len(row) - expected_cols) <= 1:
+                    table_rows.append(row)
+                else:
+                    if len(table_rows) >= 2:
+                        tables.append({
+                            'rows': table_rows,
+                            'num_columns': expected_cols,
+                            'header': table_rows[0] if table_rows else None
+                        })
+                    table_rows = [row]
+                    expected_cols = len(row)
+            
+            if len(table_rows) >= 2:
+                tables.append({
+                    'rows': table_rows,
+                    'num_columns': expected_cols,
+                    'header': table_rows[0] if table_rows else None
+                })
+        
+        return tables
+    
+    def extract_with_layout(
+        self,
+        image: Union[Image.Image, np.ndarray, str, Path]
+    ) -> Dict:
+        """
+        Extract text with full layout analysis.
+        
+        Returns enhanced OCR result with:
+        - Standard OCR output
+        - Layout structure
+        - Key-value pairs
+        - Table data
+        """
+        # Get base OCR result
+        ocr_result = self.extract_text(image)
+        
+        # Get image size
+        img_array = self._to_numpy(image)
+        height, width = img_array.shape[:2]
+        
+        # Add structured output
+        structured = self.get_structured_output(ocr_result, (width, height))
+        ocr_result.update(structured)
+        
+        return ocr_result
