@@ -113,13 +113,25 @@ class DocumentProcessor:
         """Process image file."""
         img = Image.open(file_path)
         
-        # Convert to RGB
-        if img.mode in ('RGBA', 'LA', 'P'):
+        # Convert to RGB, handling alpha channels properly
+        if img.mode in ('RGBA', 'LA', 'P', 'PA'):
             background = Image.new('RGB', img.size, (255, 255, 255))
+            
+            # Convert palette and grayscale+alpha modes to RGBA for uniform handling
             if img.mode == 'P':
                 img = img.convert('RGBA')
+            elif img.mode == 'LA':
+                # LA (grayscale + alpha) also needs conversion to preserve alpha
+                img = img.convert('RGBA')
+            elif img.mode == 'PA':
+                # PA (palette + alpha) needs conversion too
+                img = img.convert('RGBA')
+            
+            # Now img is either RGBA (converted) or was already RGBA
             if img.mode == 'RGBA':
-                background.paste(img, mask=img.split()[-1])
+                # Use alpha channel as mask for proper transparency handling
+                alpha_mask = img.split()[-1]  # Get alpha channel
+                background.paste(img, mask=alpha_mask)
             else:
                 background.paste(img)
             img = background
