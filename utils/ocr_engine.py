@@ -1,6 +1,6 @@
 """
 OCR Engine Module
-PaddleOCR wrapper with advanced visual-textual understanding
+EasyOCR-based multilingual text extraction with layout analysis
 
 Key Features:
 - Multi-language OCR (English, Hindi, Gujarati)
@@ -19,28 +19,39 @@ import numpy as np
 from PIL import Image
 from loguru import logger
 
+# Primary OCR: EasyOCR (stable, accurate, multilingual)
 try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
+    logger.warning("EasyOCR not available. Install: pip install easyocr")
+
+# Fallback: PaddleOCR
+PADDLE_AVAILABLE = False
+try:
+    import os
+    os.environ.setdefault('FLAGS_use_mkldnn', '0')
+    os.environ.setdefault('FLAGS_enable_pir_api', '0')
     from paddleocr import PaddleOCR
     PADDLE_AVAILABLE = True
 except ImportError:
-    PADDLE_AVAILABLE = False
-    logger.warning("PaddleOCR not available. Install: pip install paddleocr paddlepaddle")
+    pass
 
 
 class OCREngine:
     """
-    Multilingual OCR Engine using PaddleOCR.
+    Multilingual OCR Engine using EasyOCR (primary) with PaddleOCR fallback.
     
     Supports: English, Hindi (Devanagari), Gujarati, and mixed text.
-    Uses multiple OCR passes for best accuracy.
+    Uses GPU acceleration when available for best performance.
     """
     
-    # PaddleOCR language codes
+    # EasyOCR language codes
     LANG_CODES = {
         'english': 'en',
-        'hindi': 'devanagari',  # Devanagari script for Hindi
+        'hindi': 'hi',
         'gujarati': 'gu',
-        'multilingual': 'ch'   # Chinese model handles mixed scripts well
     }
     
     def __init__(
@@ -54,45 +65,62 @@ class OCREngine:
         Initialize OCR engine with multilingual support.
         
         Args:
-            use_gpu: Use GPU acceleration
+            use_gpu: Use GPU acceleration (CUDA)
             use_angle_cls: Enable angle classification for rotated text
             drop_score: Minimum confidence threshold
             enable_multilingual: Enable Hindi/Gujarati in addition to English
         """
-        if not PADDLE_AVAILABLE:
-            raise ImportError("PaddleOCR required. Install: pip install paddleocr paddlepaddle")
-        
         self.drop_score = drop_score
         self.enable_multilingual = enable_multilingual
+        self.use_gpu = use_gpu
+        self.reader = None
         
-        # Initialize OCR engines
-        self.ocr_engines = {}
+        if not EASYOCR_AVAILABLE and not PADDLE_AVAILABLE:
+            raise ImportError(
+                "No OCR engine available. Install: pip install easyocr "
+                "or pip install paddleocr paddlepaddle"
+            )
         
-        # Primary: English OCR (good for alphanumeric, model names, prices)
-        logger.info("Loading English OCR model...")
-        self.ocr_engines['en'] = PaddleOCR(
-            lang='en',
-            use_angle_cls=use_angle_cls,
-            use_gpu=use_gpu,
-            show_log=False,
-            det_db_thresh=0.3,
-            det_db_box_thresh=0.5
-        )
-        
-        # Secondary: Devanagari OCR (Hindi)
-        if enable_multilingual:
+        # Initialize EasyOCR (primary)
+        if EASYOCR_AVAILABLE:
+            languages = ['en']
+            if enable_multilingual:
+                languages.extend(['hi'])  # Hindi uses Devanagari
+                # Note: Gujarati ('gu') requires separate model download
+            
+            logger.info(f"Loading EasyOCR with languages: {languages}")
             try:
-                logger.info("Loading Devanagari (Hindi) OCR model...")
-                self.ocr_engines['hi'] = PaddleOCR(
-                    lang='devanagari',
-                    use_angle_cls=use_angle_cls,
-                    use_gpu=use_gpu,
-                    show_log=False
+                self.reader = easyocr.Reader(
+                    languages,
+                    gpu=use_gpu,
+                    verbose=False
                 )
+                logger.info("EasyOCR initialized successfully")
             except Exception as e:
-                logger.warning(f"Hindi OCR model not loaded: {e}")
+                logger.warning(f"EasyOCR initialization failed: {e}")
+                self.reader = None
         
-        logger.info(f"OCR Engine initialized with {len(self.ocr_engines)} language(s)")
+        # Fallback: PaddleOCR (if EasyOCR fails)
+        self.paddle_engine = None
+        if self.reader is None and PADDLE_AVAILABLE:
+            logger.info("Falling back to PaddleOCR...")
+            try:
+                self.paddle_engine = self._create_paddleocr(use_gpu=use_gpu)
+            except Exception as e:
+                logger.warning(f"PaddleOCR fallback failed: {e}")
+        
+        if self.reader is None and self.paddle_engine is None:
+            raise RuntimeError("Failed to initialize any OCR engine")
+
+    def _create_paddleocr(self, use_gpu: bool):
+        """Create PaddleOCR with compatible arguments."""
+        try:
+            return PaddleOCR(lang='en', use_gpu=use_gpu, show_log=False)
+        except (TypeError, ValueError):
+            try:
+                return PaddleOCR(lang='en', device='gpu' if use_gpu else 'cpu')
+            except Exception:
+                return PaddleOCR(lang='en')
     
     def extract_text(
         self,
@@ -102,55 +130,68 @@ class OCREngine:
         """
         Extract text from image with multi-language support.
         
-        Runs OCR in multiple languages and merges results for best coverage.
+        Uses EasyOCR (primary) or PaddleOCR (fallback) for accurate extraction.
         
         Args:
             image: Input image (PIL, numpy array, or path)
-            languages: List of languages to try ['en', 'hi']. Default: all available
+            languages: Not used (EasyOCR handles multilingual automatically)
             
         Returns:
             Dict with 'texts', 'boxes', 'confidences', 'full_text', 'language'
         """
         img_array = self._to_numpy(image)
-        languages = languages or list(self.ocr_engines.keys())
         
-        all_results = {}
+        result = None
         
-        # Run OCR for each language
-        for lang in languages:
-            if lang in self.ocr_engines:
-                try:
-                    result = self.ocr_engines[lang].ocr(img_array, cls=True)
-                    parsed = self._parse_results(result)
-                    all_results[lang] = parsed
-                except Exception as e:
-                    logger.warning(f"OCR failed for {lang}: {e}")
+        # Primary: EasyOCR
+        if self.reader is not None:
+            try:
+                result = self._run_easyocr(img_array)
+                logger.debug(f"EasyOCR extracted {result.get('count', 0)} text elements")
+            except Exception as e:
+                logger.warning(f"EasyOCR failed: {e}")
+                result = None
         
-        # Merge results from all languages
-        merged = self._merge_multilingual_results(all_results)
+        # Fallback: PaddleOCR
+        if (result is None or result.get('count', 0) == 0) and self.paddle_engine is not None:
+            logger.info("Trying PaddleOCR fallback...")
+            try:
+                result = self._run_paddleocr(img_array)
+                logger.debug(f"PaddleOCR extracted {result.get('count', 0)} text elements")
+            except Exception as e:
+                logger.warning(f"PaddleOCR fallback failed: {e}")
+        
+        if result is None:
+            result = self._empty_result()
         
         # Detect primary language
-        merged['language'] = self.detect_language(merged.get('full_text', ''))
+        result['language'] = self.detect_language(result.get('full_text', ''))
         
-        return merged
+        return result
     
-    def _parse_results(self, result: List) -> Dict:
-        """Parse PaddleOCR raw results."""
+    def _run_easyocr(self, img_array: np.ndarray) -> Dict:
+        """Run EasyOCR and return standardized result."""
+        # EasyOCR returns: [[bbox, text, confidence], ...]
+        # bbox format: [[x1,y1], [x2,y1], [x2,y2], [x1,y2]]
+        raw_results = self.reader.readtext(img_array)
+        
         texts = []
         boxes = []
         confidences = []
         
-        if result and result[0]:
-            for line in result[0]:
-                if line:
-                    try:
-                        box, (text, conf) = line
-                        if conf >= self.drop_score and text.strip():
-                            texts.append(text.strip())
-                            boxes.append(self._normalize_box(box))
-                            confidences.append(float(conf))
-                    except (ValueError, TypeError) as e:
-                        continue
+        for detection in raw_results:
+            bbox, text, conf = detection
+            
+            if conf >= self.drop_score and text.strip():
+                texts.append(text.strip())
+                # Convert polygon to [x1, y1, x2, y2]
+                boxes.append(self._normalize_box(bbox))
+                confidences.append(float(conf))
+        
+        # Sort by position (top-to-bottom, left-to-right)
+        if texts:
+            sorted_data = self._sort_by_position(texts, boxes, confidences)
+            texts, boxes, confidences = sorted_data
         
         return {
             'texts': texts,
@@ -159,6 +200,103 @@ class OCREngine:
             'full_text': '\n'.join(texts),
             'avg_confidence': np.mean(confidences) if confidences else 0.0,
             'count': len(texts)
+        }
+    
+    def _run_paddleocr(self, img_array: np.ndarray) -> Dict:
+        """Run PaddleOCR fallback and return standardized result."""
+        try:
+            result = self.paddle_engine.ocr(img_array)
+        except TypeError:
+            result = self.paddle_engine.ocr(img_array, cls=True)
+        
+        return self._parse_paddle_results(result)
+    
+    def _parse_paddle_results(self, result) -> Dict:
+        """Parse PaddleOCR raw results (handles both old and new API formats)."""
+        texts = []
+        boxes = []
+        confidences = []
+        
+        if not result:
+            return self._empty_result()
+        
+        # New PaddleOCR (PP-OCRv5) returns dict or list of dicts
+        if isinstance(result, dict):
+            rec_texts = result.get('rec_texts', result.get('texts', []))
+            rec_scores = result.get('rec_scores', result.get('scores', []))
+            dt_polys = result.get('dt_polys', result.get('boxes', []))
+            
+            for i, text in enumerate(rec_texts):
+                if text and text.strip():
+                    conf = rec_scores[i] if i < len(rec_scores) else 0.5
+                    if conf >= self.drop_score:
+                        texts.append(text.strip())
+                        if i < len(dt_polys):
+                            boxes.append(self._normalize_box(dt_polys[i]))
+                        else:
+                            boxes.append([0, 0, 0, 0])
+                        confidences.append(float(conf))
+        
+        # Handle list of dicts (batch results)
+        elif isinstance(result, list) and result and isinstance(result[0], dict):
+            for item in result:
+                rec_texts = item.get('rec_texts', item.get('texts', []))
+                rec_scores = item.get('rec_scores', item.get('scores', []))
+                dt_polys = item.get('dt_polys', item.get('boxes', []))
+                
+                for i, text in enumerate(rec_texts):
+                    if text and text.strip():
+                        conf = rec_scores[i] if i < len(rec_scores) else 0.5
+                        if conf >= self.drop_score:
+                            texts.append(text.strip())
+                            if i < len(dt_polys):
+                                boxes.append(self._normalize_box(dt_polys[i]))
+                            else:
+                                boxes.append([0, 0, 0, 0])
+                            confidences.append(float(conf))
+        
+        # Old PaddleOCR format: [[box, (text, conf)], ...]
+        elif isinstance(result, list) and result:
+            data = result[0] if result[0] else result
+            if isinstance(data, list):
+                for line in data:
+                    if line:
+                        try:
+                            if isinstance(line, (list, tuple)) and len(line) >= 2:
+                                box = line[0]
+                                text_conf = line[1]
+                                if isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2:
+                                    text, conf = text_conf[0], text_conf[1]
+                                elif isinstance(text_conf, str):
+                                    text, conf = text_conf, 0.8
+                                else:
+                                    continue
+                                
+                                if conf >= self.drop_score and text and text.strip():
+                                    texts.append(text.strip())
+                                    boxes.append(self._normalize_box(box))
+                                    confidences.append(float(conf))
+                        except (ValueError, TypeError, IndexError):
+                            continue
+        
+        return {
+            'texts': texts,
+            'boxes': boxes,
+            'confidences': confidences,
+            'full_text': '\n'.join(texts),
+            'avg_confidence': np.mean(confidences) if confidences else 0.0,
+            'count': len(texts)
+        }
+    
+    def _empty_result(self) -> Dict:
+        """Return empty OCR result structure."""
+        return {
+            'texts': [],
+            'boxes': [],
+            'confidences': [],
+            'full_text': '',
+            'avg_confidence': 0.0,
+            'count': 0
         }
     
     def _merge_multilingual_results(self, all_results: Dict) -> Dict:

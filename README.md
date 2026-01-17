@@ -9,11 +9,12 @@
 
 1. [Problem Statement](#problem-statement)
 2. [Solution Architecture](#solution-architecture)
-3. [Technical Approach](#technical-approach)
-4. [Cost & Performance Analysis](#cost--performance-analysis)
-5. [Installation & Usage](#installation--usage)
-6. [Output Specification](#output-specification)
-7. [Project Structure](#project-structure)
+3. [How It Works (Simple Overview)](#how-it-works-simple-overview)
+4. [Technical Approach](#technical-approach)
+5. [Cost & Performance Analysis](#cost--performance-analysis)
+6. [Installation & Usage](#installation--usage)
+7. [Output Specification](#output-specification)
+8. [Project Structure](#project-structure)
 
 ---
 
@@ -54,13 +55,13 @@ Build a Document AI system to extract structured fields from tractor loan quotat
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                         EXTRACTION PIPELINE                          │
+│                         EXTRACTION PIPELINE                         │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐         │
+│                                                                     │
+│   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐          │
 │   │  INPUT  │───▶│DOCUMENT │───▶│MULTILIN-│───▶│  FIELD  │         │
-│   │ PDF/IMG │    │PROCESSOR│    │GUAL OCR │    │ PARSER  │         │
-│   └─────────┘    └─────────┘    └─────────┘    └────┬────┘         │
+│   │ PDF/IMG │    │PROCESSOR│    │GUAL OCR │    │ PARSER  │          │
+│   └─────────┘    └─────────┘    └─────────┘    └────┬────┘          │
 │                                                      │              │
 │                                                      ▼              │
 │                                                ┌─────────┐         │
@@ -85,11 +86,123 @@ Build a Document AI system to extract structured fields from tractor loan quotat
 | Stage | Component | Technology | Description |
 |:-----:|:----------|:-----------|:------------|
 | 1 | Document Processor | pdf2image, PyMuPDF | PDF-to-image conversion, quality enhancement |
-| 2 | OCR Engine | PaddleOCR | Multilingual text extraction (EN/HI/GU) |
+| 2 | OCR Engine | EasyOCR (PaddleOCR fallback) | Multilingual text extraction (EN/HI/GU) |
 | 3 | Field Parser | Regex + Heuristics | Pattern-based structured field extraction |
 | 4 | Validator | RapidFuzz | Fuzzy matching, cross-field validation |
 | 5 | Detector | YOLOv8 / CV2 | Signature and stamp localization |
-| 6 | VLM Fallback | GPT-4o-mini / Qwen | Enhanced extraction for low-confidence cases |
+| 6 | VLM Fallback | OpenAI / Azure OpenAI / Qwen | Enhanced extraction for handwritten & complex documents |
+
+---
+
+## How It Works (Simple Overview)
+
+When you run the extraction on an invoice image, here's what happens step-by-step:
+
+```
+INPUT: invoice.png
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 1: DOCUMENT PREPROCESSING                                 │
+│  ─────────────────────────────────────────────────────────────  │
+│  • Load image (PNG/JPG) or convert PDF to image                 │
+│  • Enhance quality: sharpen edges, increase contrast            │
+│  • Resize if too large (max 4096px)                             │
+│  Output: Clean, normalized image ready for OCR                  │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 2: TEXT EXTRACTION (OCR)                                  │
+│  ─────────────────────────────────────────────────────────────  │
+│  • EasyOCR scans the image for text                             │
+│  • Detects English, Hindi, Gujarati automatically               │
+│  • Returns: text content + bounding box positions               │
+│  Output: List of 50+ text elements with coordinates             │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 3: FIELD PARSING (Rule-Based)                             │
+│  ─────────────────────────────────────────────────────────────  │
+│  • Pattern matching: "50 HP" → horse_power = 50                 │
+│  • Spatial analysis: text at top = likely dealer name           │
+│  • Table detection: rows with prices = likely asset cost        │
+│  • Key-value pairs: "Total: ₹5,25,000" → asset_cost = 525000    │
+│  Output: Extracted fields with confidence scores                │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 4: VLM ENHANCEMENT (if --use_vlm enabled)                 │
+│  ─────────────────────────────────────────────────────────────  │
+│  • Send image to GPT-4o / Azure OpenAI                          │
+│  • AI reads handwritten text that OCR missed                    │
+│  • Understands context: "RANI - 306115" is PIN, not price       │
+│  • Returns structured JSON with high confidence                 │
+│  Output: AI-extracted fields merged with rule-based results     │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 5: CONSENSUS VOTING                                       │
+│  ─────────────────────────────────────────────────────────────  │
+│  • Compare rule-based vs VLM extractions                        │
+│  • If both agree → high confidence (boost score)                │
+│  • If conflict → pick higher confidence value                   │
+│  • Fuzzy matching: "Kissan Tractor" ≈ "KISSAN TRACTOR"          │
+│  Output: Best value for each field with final confidence        │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 6: SIGNATURE & STAMP DETECTION                            │
+│  ─────────────────────────────────────────────────────────────  │
+│  • Scan bottom 50% of image (where signatures usually are)      │
+│  • Detect ink marks using contour analysis                      │
+│  • Detect colored stamps (blue/red circles)                     │
+│  Output: present=true/false + bounding box [x1,y1,x2,y2]        │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  STEP 7: VALIDATION & OUTPUT                                    │
+│  ─────────────────────────────────────────────────────────────  │
+│  • Range checks: HP must be 15-150, Cost must be ₹50K-₹50L      │
+│  • Filter bad values: PIN codes, phone numbers                  │
+│  • Calculate overall confidence score                           │
+│  • Generate final JSON output                                   │
+└─────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+OUTPUT: result.json
+{
+  "doc_id": "invoice_001",
+  "fields": {
+    "dealer_name": "Kissan Tractor Agency",
+    "model_name": "Swaraj 744 FE",
+    "horse_power": 25,
+    "asset_cost": 550000,
+    "signature": {"present": true, "bbox": [...]},
+    "stamp": {"present": true, "bbox": [...]}
+  },
+  "confidence": 0.87
+}
+```
+
+### Quick Example
+
+**Input:** A scanned invoice image with mixed printed and handwritten text
+
+**Processing:**
+1. OCR reads printed text: "KISSAN TRACTOR AGENCY", "SWARAJ", "H.P."
+2. OCR struggles with handwritten "25" and "5,50,000"
+3. VLM (GPT-4o) reads the handwritten parts correctly
+4. Consensus combines both: dealer from OCR + price from VLM
+5. Validation confirms HP=25 is valid (15-150 range)
+6. Signature detected in bottom-right corner
+
+**Output:** Complete JSON with 87% confidence
 
 ---
 
@@ -154,7 +267,47 @@ Comprehensive regex patterns cover multiple formats:
 | Model Name | `Mahindra 575 DI`, `John Deere 5050D`, `Swaraj 744 FE` |
 | Dealer Name | Header analysis, business suffix detection (`Pvt Ltd`, `Motors`) |
 
-### 3. Cross-Validation Logic
+### 4. Negative Pattern Matching (Exclusion Zones)
+
+A critical preprocessing step that **prevents false positives** by identifying regions that should NOT be used for numeric extraction:
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  NEGATIVE PATTERN MATCHING PIPELINE                               │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  INPUT: All OCR text elements with bounding boxes                 │
+│                          ↓                                        │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  EXCLUSION PATTERN DETECTION                                │ │
+│  │  • 6-digit numbers (PIN codes: 306115, 382481)              │ │
+│  │  • 10-11 digit numbers (phone: 9876543210)                  │ │
+│  │  • Address keywords (Dist, Taluka, Road, Nagar)             │ │
+│  │  • ID numbers (GST, PAN, Invoice No.)                       │ │
+│  │  • Email addresses (@domain.com)                            │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                          ↓                                        │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  ZONE EXPANSION (30% horizontal, 50% vertical)              │ │
+│  │  Catches adjacent numbers that may be related               │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│                          ↓                                        │
+│  OUTPUT: Filtered text elements (safe for HP/Cost extraction)    │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+| Exclusion Pattern | Example Match | Prevents |
+|:------------------|:--------------|:---------|
+| `\b\d{6}\b` | `306115` | PIN codes as asset_cost |
+| `\b\d{10,11}\b` | `9876543210` | Phone numbers as asset_cost |
+| `Dist.*\d{6}` | `Dist. Pali - 306115` | Address block numbers |
+| `(?:Road\|Nagar\|Colony)` | `Gandhi Nagar Road` | Address line markers |
+| `GST.*[A-Z0-9]` | `GSTIN: 08AABCM...` | Tax ID regions |
+
+**Why This Matters:** Without exclusion zones, the system would frequently extract `306115` (PIN code) as `asset_cost` because it passes the 50K-5M range check.
+
+### 5. Cross-Validation Logic
 
 HP values are validated against a model-HP mapping table:
 
@@ -164,11 +317,11 @@ MODEL_HP_MAP = {
     "JOHN DEERE 5050": 50,
     "SWARAJ 744": 48,
     "TAFE 7515": 75,
-    # 40+ models supported
+    # 30+ models supported
 }
 ```
 
-### 4. Multilingual Support & Transliteration
+### 6. Multilingual Support & Transliteration
 
 Full support for **English, Hindi, Gujarati, and mixed vernacular** documents:
 
@@ -184,7 +337,7 @@ Full support for **English, Hindi, Gujarati, and mixed vernacular** documents:
 - Business terms: ट्रैक्टर्स→Tractors, मोटर्स→Motors
 - Tractor brands: महिंद्रा→Mahindra, स्वराज→Swaraj
 
-### 5. Post-Processing & Quality Assurance
+### 7. Post-Processing & Quality Assurance
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -210,14 +363,14 @@ Full support for **English, Hindi, Gujarati, and mixed vernacular** documents:
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 6. Signature & Stamp Detection
+### 8. Signature & Stamp Detection
 
 | Detection Type | Method | Features Used |
 |:---------------|:-------|:--------------|
 | Signature | Contour Analysis | Ink density, aspect ratio (width > height) |
 | Stamp | Color Detection | Blue/Red/Purple HSV ranges, circularity |
 
-### 7. Tiered Processing
+### 9. Tiered Processing
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -231,7 +384,7 @@ Full support for **English, Hindi, Gujarati, and mixed vernacular** documents:
 └──────────────────────────────────────────────────────────┘
 ```
 
-### 8. Pseudo-Labeling & Consensus Methods
+### 10. Pseudo-Labeling & Consensus Methods
 
 #### Handling Lack of Ground Truth
 
@@ -306,6 +459,63 @@ Since no pre-labeled data is provided, our system implements strategies from wea
 | Consensus (60-80% agreement) | Majority wins | No change |
 | Conflict Resolution | Higher confidence wins | -0.05 to -0.10 |
 
+#### Field-Specific Trust Weights
+
+A key insight: **different fields benefit from different extraction methods**. The consensus engine applies adaptive trust weights based on field characteristics:
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  FIELD-SPECIFIC TRUST WEIGHTS                                     │
+├───────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  Field: dealer_name                                               │
+│  ┌──────────────┐      ┌──────────────┐                          │
+│  │ Rule-based   │ 1.0  │ VLM          │ 0.85                     │
+│  │ (preferred)  │ ──▶  │ (may over-   │                          │
+│  │              │      │  interpret)  │                          │
+│  └──────────────┘      └──────────────┘                          │
+│  Reason: Usually printed in header, OCR reliable                  │
+│                                                                   │
+│  Field: horse_power                                               │
+│  ┌──────────────┐      ┌──────────────┐                          │
+│  │ Rule-based   │ 0.5  │ VLM          │ 1.1                      │
+│  │ (high noise) │      │ (boosted)    │ ──▶                      │
+│  └──────────────┘      └──────────────┘                          │
+│  Reason: Often handwritten, OCR struggles with noise              │
+│                                                                   │
+│  Field: asset_cost                                                │
+│  ┌──────────────┐      ┌──────────────┐                          │
+│  │ Rule-based   │ 0.4  │ VLM          │ 1.15                     │
+│  │ (PIN risk)   │      │ (boosted)    │ ──▶                      │
+│  └──────────────┘      └──────────────┘                          │
+│  Reason: Handwritten + PIN code false positive risk               │
+│                                                                   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+| Field | Rule-based Weight | VLM Weight | Rationale |
+|:------|:------------------|:-----------|:----------|
+| `dealer_name` | **1.0** | 0.85 | Printed text, structured header |
+| `model_name` | 0.75 | **1.0** | VLM better at full model variants |
+| `horse_power` | 0.5 | **1.1** | Often handwritten, VLM excels |
+| `asset_cost` | 0.4 | **1.15** | Handwritten + contextual understanding |
+
+**Document Trait Adjustments:**
+
+The system also detects document characteristics and adjusts weights:
+
+| Trait | Rule-based Adjustment | VLM Adjustment |
+|:------|:----------------------|:---------------|
+| `has_handwriting` | ×0.7 | ×1.2 |
+| `is_hindi` | ×0.9 | ×1.0 |
+| `is_gujarati` | ×0.85 | ×1.0 |
+| `low_quality` | ×0.6 | ×0.9 |
+
+**Example:** For a document with handwriting detected:
+- `horse_power` from Rule-based: `0.5 × 0.7 = 0.35` effective weight
+- `horse_power` from VLM: `1.1 × 1.2 = 1.32` effective weight
+- VLM result will dominate the consensus vote
+
 #### Bootstrapping & Iterative Refinement
 
 ```python
@@ -333,9 +543,17 @@ for iteration in range(max_iterations):
 | Cost Range | ₹50K - ₹50L reasonable | ✓ Pass or ⚠ Warning |
 | Model-Cost | High HP → Higher cost expected | ✓ Pass or ⚠ Warning |
 
-### 9. Advanced Prompt Engineering (VLM)
+### 11. Vision Language Model (VLM) Integration
 
-The VLM fallback uses enterprise-grade prompt engineering optimized for IDFC Bank's document processing needs:
+The system supports multiple VLM providers for enhanced extraction, especially for handwritten text:
+
+| Provider | Model | Best For | Cost |
+|:---------|:------|:---------|:-----|
+| OpenAI | GPT-4o-mini | Cost-effective extraction | ~$0.003/doc |
+| Azure OpenAI | GPT-4o | Enterprise deployments | ~$0.01/doc |
+| Qwen | Qwen2.5-VL | Local/offline processing | Free (compute) |
+
+The VLM uses enterprise-grade prompt engineering optimized for IDFC Bank's document processing needs:
 
 #### Prompt Engineering Best Practices Applied
 
@@ -355,18 +573,18 @@ The VLM fallback uses enterprise-grade prompt engineering optimized for IDFC Ban
 │  SYSTEM PROMPT                                              │
 │  ├── Role: IDFC Bank Document AI Specialist                 │
 │  ├── Domain Expertise: Indian tractor brands, currencies    │
-│  └── Accuracy Standards: ≥95% DLA requirement              │
+│  └── Accuracy Standards: ≥95% DLA requirement               │
 ├─────────────────────────────────────────────────────────────┤
 │  USER PROMPT                                                │
-│  ├── Step-by-Step Extraction Guide                         │
-│  │   ├── 1. Dealer Name (header, letterhead patterns)      │
-│  │   ├── 2. Model Name (brand + number + variant)          │
-│  │   ├── 3. Horse Power (HP, BHP, अश्वशक्ति)               │
-│  │   └── 4. Asset Cost (Total, कुल, currency formats)      │
-│  ├── Few-Shot Examples (3 diverse scenarios)               │
-│  ├── Output JSON Schema                                    │
-│  ├── Confidence Scoring Guidelines                         │
-│  └── Critical Rules (no hallucination, transliteration)    │
+│  ├── Step-by-Step Extraction Guide                          │
+│  │   ├── 1. Dealer Name (header, letterhead patterns)       │
+│  │   ├── 2. Model Name (brand + number + variant)           │
+│  │   ├── 3. Horse Power (HP, BHP, अश्वशक्ति)                  │
+│  │   └── 4. Asset Cost (Total, कुल, currency formats)       │
+│  ├── Few-Shot Examples (3 diverse scenarios)                │
+│  ├── Output JSON Schema                                     │
+│  ├── Confidence Scoring Guidelines                          │
+│  └── Critical Rules (no hallucination, transliteration)     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -395,7 +613,8 @@ def validate_extraction(result):
 | Validation | RapidFuzz | — | 0.1s |
 | Detection | OpenCV | $0.0001 | 0.3s |
 | **Tier 1 Total** | — | **$0.0005** | **~2.5s** |
-| VLM (if needed) | GPT-4o-mini | +$0.003 | +3s |
+| VLM (OpenAI) | GPT-4o-mini | +$0.003 | +3s |
+| VLM (Azure OpenAI) | GPT-4o | +$0.01 | +5s |
 
 **Weighted Average**: ~$0.001 per document
 
@@ -438,10 +657,29 @@ python executable.py --input invoice.pdf --output result.json
 python executable.py --input_dir ./invoices/ --output_dir ./results/
 ```
 
-**With VLM Enhancement**
+**With VLM Enhancement (OpenAI)**
 ```bash
 export OPENAI_API_KEY=your_api_key
-python executable.py --input invoice.pdf --use_vlm
+python executable.py --input invoice.pdf --use_vlm --vlm_provider openai
+```
+
+**With VLM Enhancement (Azure OpenAI)**
+```bash
+# Set environment variables
+export AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+export AZURE_OPENAI_API_KEY=your_azure_key
+export AZURE_OPENAI_DEPLOYMENT=gpt-4o
+
+# Run extraction
+python executable.py --input invoice.pdf --use_vlm --vlm_provider azure
+```
+
+**Or use CLI arguments for Azure:**
+```bash
+python executable.py --input invoice.pdf --use_vlm --vlm_provider azure \
+    --azure_endpoint https://your-resource.openai.azure.com \
+    --azure_deployment gpt-4o \
+    --azure_api_key your_key
 ```
 
 ### CLI Options
@@ -450,13 +688,22 @@ python executable.py --input invoice.pdf --use_vlm
 |:-------|:------------|:--------|
 | `--input`, `-i` | Input document path | — |
 | `--input_dir`, `-d` | Input directory for batch processing | — |
-| `--output`, `-o` | Output JSON path | `./sample_output/<name>_result.json` |
+| `--output`, `-o` | Output JSON path | `./sample_output/<doc_id>_result.json` |
 | `--output_dir` | Output directory for batch results | `./output` |
-| `--use_vlm` | Enable VLM fallback | `False` |
-| `--vlm_provider` | VLM provider (`openai` or `qwen`) | `openai` |
+| `--use_vlm` | Enable VLM for enhanced extraction | `False` |
+| `--vlm_provider` | VLM provider (`openai`, `azure`, or `qwen`) | `openai` |
 | `--yolo_model` | Path to custom YOLO model | — |
 | `--no_gpu` | Disable GPU acceleration | `False` |
 | `--debug` | Enable debug logging | `False` |
+
+#### Azure OpenAI Options
+
+| Option | Environment Variable | Description |
+|:-------|:---------------------|:------------|
+| `--azure_endpoint` | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI resource URL |
+| `--azure_deployment` | `AZURE_OPENAI_DEPLOYMENT` | Model deployment name (e.g., `gpt-4o`) |
+| `--azure_api_key` | `AZURE_OPENAI_API_KEY` | Azure OpenAI API key |
+| `--azure_api_version` | `AZURE_OPENAI_API_VERSION` | API version (default: `2024-02-15-preview`) |
 
 ---
 
@@ -520,7 +767,8 @@ submission/
 │   ├── field_parser.py        # Pattern-based extraction
 │   ├── validator.py           # Fuzzy matching & validation
 │   ├── yolo_detector.py       # Signature/stamp detection
-│   └── vlm_extractor.py       # VLM integration
+│   ├── vlm_extractor.py       # VLM integration (OpenAI/Azure/Qwen)
+│   └── consensus_engine.py    # Multi-pipeline consensus voting
 └── sample_output/
     └── result.json            # Example output
 ```

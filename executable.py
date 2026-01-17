@@ -21,6 +21,14 @@ from typing import Dict, List, Optional, Tuple, Union
 
 from loguru import logger
 
+# Load environment variables from .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Loads from .env in current directory or parent directories
+    logger.debug("Loaded environment variables from .env file")
+except ImportError:
+    pass  # python-dotenv not installed, use shell environment variables
+
 # Pipeline components
 from utils.document_processor import DocumentProcessor
 from utils.ocr_engine import OCREngine
@@ -48,17 +56,30 @@ class InvoiceExtractor:
         use_vlm: bool = False,
         vlm_provider: str = 'openai',
         yolo_model_path: Optional[str] = None,
-        use_gpu: bool = True
+        use_gpu: bool = True,
+        azure_endpoint: Optional[str] = None,
+        azure_deployment: Optional[str] = None,
+        azure_api_key: Optional[str] = None,
+        azure_api_version: str = '2024-02-15-preview'
     ):
         """
         Initialize extraction pipeline.
         
         Args:
             use_vlm: Use Vision Language Model for enhanced extraction
-            vlm_provider: 'openai' or 'qwen' (if use_vlm=True)
+            vlm_provider: 'openai', 'azure', or 'qwen' (if use_vlm=True)
             yolo_model_path: Path to trained YOLO model
             use_gpu: Use GPU acceleration where available
+            azure_endpoint: Azure OpenAI endpoint URL
+            azure_deployment: Azure OpenAI deployment name
+            azure_api_key: Azure OpenAI API key
+            azure_api_version: Azure OpenAI API version
         """
+        # Store Azure settings for VLM initialization
+        self.azure_endpoint = azure_endpoint
+        self.azure_deployment = azure_deployment
+        self.azure_api_key = azure_api_key
+        self.azure_api_version = azure_api_version
         logger.info("Initializing Invoice Extractor...")
         
         # Document processor
@@ -110,7 +131,13 @@ class InvoiceExtractor:
         if self._vlm is None and self.use_vlm:
             try:
                 from utils.vlm_extractor import VLMExtractor
-                self._vlm = VLMExtractor(provider=self.vlm_provider)
+                self._vlm = VLMExtractor(
+                    provider=self.vlm_provider,
+                    api_key=self.azure_api_key if self.vlm_provider == 'azure' else None,
+                    azure_endpoint=self.azure_endpoint,
+                    azure_deployment=self.azure_deployment,
+                    azure_api_version=self.azure_api_version
+                )
                 logger.info(f"VLM loaded: {self.vlm_provider}")
             except Exception as e:
                 logger.warning(f"VLM initialization failed: {e}")
@@ -207,13 +234,15 @@ class InvoiceExtractor:
             )
             logger.debug(f"Generated pseudo-labels for {sum(1 for p in pseudo_labels.values() if p.get('is_pseudo_label'))} fields")
             
-            # If confidence is low, use VLM and apply consensus
-            if initial_confidence < 0.75 and self.use_vlm and len(extraction_methods) > 1:
-                logger.info("Low confidence - applying consensus voting...")
+            # Use VLM when enabled - always apply consensus for better accuracy
+            # VLM is especially important for handwritten text that OCR struggles with
+            if self.use_vlm and len(extraction_methods) > 1:
+                logger.info("Applying VLM + consensus voting for enhanced extraction...")
                 
-                # Run consensus across methods
+                # Run consensus across methods with adaptive trust weighting
+                # Pass ocr_result to enable document trait detection for field-specific weights
                 consensus_results = self.consensus_engine.extract_with_consensus(
-                    extraction_methods, method_names
+                    extraction_methods, method_names, ocr_result=ocr_result
                 )
                 
                 # Convert consensus to parsed_fields format
@@ -486,8 +515,13 @@ Examples:
   Batch processing:
     python executable.py --input_dir ./invoices/ --output_dir ./results/
     
-  With VLM enhancement:
-    python executable.py --input invoice.pdf --use_vlm
+  With VLM enhancement (OpenAI):
+    python executable.py --input invoice.pdf --use_vlm --vlm_provider openai
+    
+  With VLM enhancement (Azure OpenAI):
+    python executable.py --input invoice.pdf --use_vlm --vlm_provider azure \\
+        --azure_endpoint https://your-resource.openai.azure.com \\
+        --azure_deployment gpt-4o-mini
         """
     )
     
@@ -496,7 +530,15 @@ Examples:
     parser.add_argument('--output', '-o', type=str, help='Output JSON path')
     parser.add_argument('--output_dir', type=str, default='./output', help='Output directory')
     parser.add_argument('--use_vlm', action='store_true', help='Use VLM for better accuracy')
-    parser.add_argument('--vlm_provider', type=str, default='openai', choices=['openai', 'qwen'])
+    parser.add_argument('--vlm_provider', type=str, default='openai', choices=['openai', 'azure', 'qwen'],
+                        help='VLM provider: openai, azure, or qwen')
+    
+    # Azure OpenAI specific arguments
+    parser.add_argument('--azure_endpoint', type=str, help='Azure OpenAI endpoint URL (or set AZURE_OPENAI_ENDPOINT)')
+    parser.add_argument('--azure_deployment', type=str, help='Azure OpenAI deployment name (or set AZURE_OPENAI_DEPLOYMENT)')
+    parser.add_argument('--azure_api_key', type=str, help='Azure OpenAI API key (or set AZURE_OPENAI_API_KEY)')
+    parser.add_argument('--azure_api_version', type=str, default='2024-02-15-preview', help='Azure OpenAI API version')
+    
     parser.add_argument('--yolo_model', type=str, help='Path to YOLO model')
     parser.add_argument('--no_gpu', action='store_true', help='Disable GPU')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
@@ -517,18 +559,25 @@ Examples:
         use_vlm=args.use_vlm,
         vlm_provider=args.vlm_provider,
         yolo_model_path=args.yolo_model,
-        use_gpu=not args.no_gpu
+        use_gpu=not args.no_gpu,
+        azure_endpoint=args.azure_endpoint,
+        azure_deployment=args.azure_deployment,
+        azure_api_key=args.azure_api_key,
+        azure_api_version=args.azure_api_version
     )
     
     # Process
-    if args.input:
+    input_dir_path = Path(args.input_dir) if args.input_dir else None
+    if args.input or (input_dir_path and input_dir_path.is_file()):
         # Single document
-        result = extractor.extract(args.input)
+        input_path = args.input or str(input_dir_path)
+        result = extractor.extract(input_path)
         
-        # Determine output path
+        # Determine output path - use doc_id from result for consistent naming
         output_path = args.output
         if not output_path:
-            output_path = f"./sample_output/{Path(args.input).stem}_result.json"
+            doc_id = result.get('doc_id', Path(input_path).stem)
+            output_path = f"./sample_output/{doc_id}_result.json"
         
         # Save result
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -550,15 +599,19 @@ Examples:
         
         # Print summary
         successful = sum(1 for r in results if r.get('confidence', 0) > 0)
-        avg_conf = sum(r.get('confidence', 0) for r in results) / len(results) if results else 0
-        avg_time = sum(r.get('processing_time_sec', 0) for r in results) / len(results) if results else 0
+        total_docs = len(results)
+        avg_conf = sum(r.get('confidence', 0) for r in results) / total_docs if total_docs else 0
+        avg_time = sum(r.get('processing_time_sec', 0) for r in results) / total_docs if total_docs else 0
         total_cost = sum(r.get('cost_estimate_usd', 0) for r in results)
         
         print(f"\n{'='*55}")
         print(f"  BATCH PROCESSING COMPLETE")
         print(f"{'='*55}")
-        print(f"  Documents Processed: {len(results)}")
-        print(f"  Successful:          {successful} ({successful/len(results)*100:.0f}%)")
+        print(f"  Documents Processed: {total_docs}")
+        if total_docs:
+            print(f"  Successful:          {successful} ({successful/total_docs*100:.0f}%)")
+        else:
+            print(f"  Successful:          0 (0%)")
         print(f"  Average Confidence:  {avg_conf:.1%}")
         print(f"  Average Time:        {avg_time:.1f}s per document")
         print(f"  Total Cost:          ${total_cost:.4f}")
