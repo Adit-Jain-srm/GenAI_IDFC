@@ -15,6 +15,7 @@ Optimized for IDFC Bank's tractor loan quotation processing.
 import re
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
+from loguru import logger
 
 
 class FieldParser:
@@ -31,11 +32,17 @@ class FieldParser:
     
     # ============ HORSE POWER PATTERNS ============
     HP_PATTERNS = [
-        # English patterns
+        # English patterns - standard
         r'(\d{2,3})\s*(?:HP|hp|H\.P\.|Hp)',
         r'(\d{2,3})\s*(?:BHP|bhp|B\.H\.P\.)',
         r'(?:Horse\s*Power|HP|Power)[:\s]*(\d{2,3})',
         r'(?:Engine|Motor)[:\s]*(\d{2,3})\s*(?:HP|hp)',
+        # Handwritten patterns - dots/spaces between number and HP
+        r'(\d{2,3})\s*[\.]{2,}\s*(?:HP|hp|H\.P\.|Hp)',  # 25..... H.P.
+        r'(\d{2,3})\s*[\.\-_]+\s*(?:HP|hp|H\.P\.)',     # 25... H.P.
+        r'TRACTOR\s*[\.]+\s*(\d{2,3})\s*[\.]*\s*H\.?P\.?',  # TRACTOR ...25... H.P.
+        # Pattern with model name context
+        r'(?:FE|XT|DI)\s*(?:TRACTOR)?\s*[\.]*\s*(\d{2,3})\s*[\.]*\s*H\.?P\.?',
         # Hindi patterns
         r'(\d{2,3})\s*(?:अश्वशक्ति|एचपी|हॉर्स\s*पावर)',
         r'(?:अश्वशक्ति|पावर)[:\s]*(\d{2,3})',
@@ -44,6 +51,8 @@ class FieldParser:
         # Generic: number near HP keyword
         r'HP[:\s\-]*(\d{2,3})',
         r'(\d{2,3})[:\s\-]*HP',
+        # Looser pattern - any 2-digit number followed by H.P. within 20 chars
+        r'(\d{2})\s*.{0,10}H\.?P\.?',
     ]
     
     # ============ ASSET COST PATTERNS ============
@@ -61,8 +70,63 @@ class FieldParser:
         r'(?:Ex[\-\s]*Showroom|On[\-\s]*Road)[:\s]*[₹Rs\.INR\s]*([\d,]+)',
     ]
     
+    # ============ PIN CODE / ADDRESS PATTERNS (to filter out) ============
+    PIN_CODE_CONTEXT_PATTERNS = [
+        # PIN code after location names (common Indian address format)
+        r'(?:Dist|District|Pin|Pincode|PIN|Taluka|Tehsil|Block)[\.\s\-:]*\d{6}',
+        r'\b[A-Z][a-z]+[\s\-]+\d{6}\b',  # City/Town name followed by 6 digits
+        r'(?:Rajasthan|Gujarat|Maharashtra|MP|UP|Bihar|Punjab|Haryana|HP|Uttarakhand|Karnataka|Tamil Nadu|Kerala|AP|Telangana|Odisha|WB|Assam|Jharkhand|Chhattisgarh|Goa)\s*[\(\-]?\s*\d{6}',
+        r'\(\s*Raj\.?\s*\)\s*[\-\s]*\d{6}',  # (Raj.) - 306115 pattern
+        r'[A-Za-z]+\s*[\-\(]\s*\d{6}\s*[\)]?',  # RANI - 306115 or RANI (306115)
+    ]
+    
+    # ============ EXCLUSION ZONE PATTERNS (Negative Pattern Matching) ============
+    # These patterns identify regions that should NOT be used for numeric field extraction
+    # Using negative pattern matching prevents PIN codes, phone numbers, etc. from being 
+    # mistakenly extracted as prices or other numeric fields
+    #
+    # IMPORTANT: We do NOT use blanket numeric patterns like \b\d{6}\b here because:
+    # - Valid tractor prices are often 6 digits (e.g., 525000, 350000, 850000)
+    # - Context-based patterns below identify ADDRESS regions where PIN codes appear
+    # - The _is_likely_pin_code() method handles contextual PIN vs price distinction
+    #
+    EXCLUSION_ZONE_PATTERNS = [
+        # === Phone numbers (10-11 digits are safe to exclude - never valid prices) ===
+        r'\b\d{10,11}\b',                # Phone numbers (10-11 digits)
+        r'\b98\d{8}\b',                  # Mobile starting with 98
+        r'\b99\d{8}\b',                  # Mobile starting with 99
+        r'\b[6-9]\d{9}\b',               # Indian mobile numbers
+        
+        # === Address/Location indicators (context-based, not just numbers) ===
+        r'(?:Dist|District|Taluka|Tehsil|Block|Village|Town|City)',
+        r'(?:Pin|Pincode|PIN)[\s\-:]*\d{6}',  # PIN with label (e.g., "PIN: 306115")
+        r'(?:RANI|Rani|rani)[\s\-]+\d{6}',    # Specific: "RANI - 306115" pattern
+        r'[\-\s]\d{6}\s*[\(\,]',              # Number followed by bracket/comma in address
+        r'(?:Contact|Contect|Phone|Mobile|Tel|Fax)[\s\-:]*[\d\+]',
+        r'(?:GST|GSTIN|PAN|TIN|CIN)[\s\-:]*[A-Z0-9]',
+        r'\S+@\S+\.\S+',                 # Email addresses
+        
+        # === Address line patterns ===
+        r'(?:Road|Street|Lane|Nagar|Colony|Sector|Phase|Plot|Ward|Marg)',
+        r'(?:Near|Opp|Behind|Adjacent|Next to|Beside)',
+        r'Kenpura|Kendra|Market|Chowk',  # Common address words
+        
+        # === State identifiers with numbers ===
+        r'\((?:Raj|Guj|MH|MP|UP|HR|PB|HP|UK|KA|TN|KL|AP|TS|OR|WB)\.?\)\s*[\-\s]*\d{6}',
+        r'(?:Rajasthan|Gujarat|Maharashtra)\s*[\-\s]*\d{6}',
+        r'Dist[\.\-\s]*Pali',            # Specific district pattern from test doc
+        
+        # === Header/Footer metadata ===
+        r'(?:Invoice|Bill|Quotation)\s*(?:No|Number|#)',
+        r'(?:Date|Dated?)[\s\-:]*\d{1,2}[\-/\.]\d{1,2}[\-/\.]\d{2,4}',
+    ]
+    
     # ============ MODEL NAME PATTERNS ============
     MODEL_PATTERNS = [
+        # Solis (Yanmar subsidiary) - also handle OCR errors like Solus, S0lis
+        r'(S[o0][l1][iIu][s5]\s+\d{3,4}\s*(?:2WD|4WD|DI|XT)?(?:\s+\d{2,3}\s*HP)?)',
+        r'(SOLIS\s+\d{3,4}\s*(?:2WD|4WD|DI|XT)?)',
+        r'(Solus\s+\d{3,4}\s*(?:2WD|4WD)?)',  # Common OCR misread
         # Mahindra variants
         r'(Mahindra\s+\d{3,4}\s*(?:DI|XP|XT|Plus|Power)?(?:\s*Plus)?)',
         r'(MAHINDRA\s+\d{3,4}\s*(?:DI|XP|XT|Plus|Power)?)',
@@ -74,8 +138,10 @@ class FieldParser:
         r'(TAFE\s+\d{4})',
         r'(Massey\s*Ferguson\s+\d{3,4})',
         r'(MF[\s\-]*\d{3,4})',
-        # Swaraj
-        r'(Swaraj\s+\d{3,4}(?:\s*FE|\s*XT)?)',
+        # Swaraj - various formats and OCR variants
+        r'(Swaraj\s+\d{3,4}\s*(?:FE|XT|DI)?(?:\s*TRACTOR)?)',
+        r'(SWARAJ\s+\d{3,4}\s*(?:FE|XT|DI)?)',
+        r'(Swaraj\s+\d{3}\s*FE)',  # Swaraj 744 FE specific
         # Sonalika
         r'(Sonalika\s+(?:DI\s*)?\d+(?:\s*[A-Z]+)?)',
         r'(Sonalika\s+[A-Z]+\s*\d+)',
@@ -92,6 +158,12 @@ class FieldParser:
         r'(Escorts\s+\d+)',
         # Indo Farm
         r'(Indo\s*Farm\s+\d+)',
+        # Captain
+        r'(Captain\s+\d{3,4})',
+        # VST / Mitsubishi
+        r'(VST\s+\w+\s*\d+)',
+        # Force Motors
+        r'(Force\s+(?:Orchard|Sanman|Abhiman)\s*\d*)',
         # Generic patterns
         r'(?:Model|Tractor)[:\s]+([A-Za-z]+[\s\-]*\d{3,4}[A-Za-z]*)',
     ]
@@ -107,10 +179,10 @@ class FieldParser:
     # Business suffixes for dealer detection
     BUSINESS_SUFFIXES = [
         'pvt', 'ltd', 'private', 'limited', 'llp',
-        'tractors', 'motors', 'auto', 'automobiles', 'agencies',
-        'enterprises', 'trading', 'corporation', 'associates',
-        'ट्रैक्टर्स', 'मोटर्स', 'एजेंसी',  # Hindi
-        'ટ્રેક્ટર્સ', 'મોટર્સ',  # Gujarati
+        'tractor', 'tractors', 'motors', 'auto', 'automobiles', 'agencies',
+        'enterprises', 'trading', 'corporation', 'associates', 'dealer',
+        'ट्रैक्टर', 'ट्रैक्टर्स', 'मोटर्स', 'एजेंसी',  # Hindi
+        'ટ્રેક્ટર', 'ટ્રેક્ટર્સ', 'મોટર્સ',  # Gujarati
     ]
     
     # Key-value keywords for spatial detection
@@ -139,16 +211,143 @@ class FieldParser:
         self._hp_compiled = [re.compile(p, re.IGNORECASE) for p in self.HP_PATTERNS]
         self._cost_compiled = [re.compile(p, re.IGNORECASE) for p in self.COST_PATTERNS]
         self._model_compiled = [re.compile(p, re.IGNORECASE) for p in self.MODEL_PATTERNS]
+        self._pin_context_compiled = [re.compile(p, re.IGNORECASE) for p in self.PIN_CODE_CONTEXT_PATTERNS]
+        self._exclusion_compiled = [re.compile(p, re.IGNORECASE) for p in self.EXCLUSION_ZONE_PATTERNS]
+        
+        # Cache for exclusion zones (reset per document)
+        self._exclusion_zones = []
+    
+    # ============ NEGATIVE PATTERN MATCHING (EXCLUSION ZONES) ============
+    
+    def _identify_exclusion_zones(
+        self,
+        texts: List[str],
+        boxes: List[List[int]]
+    ) -> List[Tuple[int, int, int, int]]:
+        """
+        Identify regions that should NOT be used for price/HP extraction.
+        
+        This is a preemptive filtering step that marks address, contact,
+        and identification number regions as exclusion zones BEFORE
+        attempting numeric field extraction.
+        
+        **Negative Pattern Matching Strategy:**
+        - Detects address indicators (District, PIN, etc.)
+        - Identifies phone/mobile numbers
+        - Marks email/GST/PAN regions
+        - Expands zones to catch nearby false positives
+        
+        Returns:
+            List of (x1, y1, x2, y2) bounding boxes for exclusion zones
+        """
+        exclusion_zones = []
+        excluded_texts = []  # For logging
+        
+        for text, box in zip(texts, boxes):
+            is_exclusion = False
+            matched_pattern = None
+            
+            # Check against exclusion patterns
+            for pattern in self._exclusion_compiled:
+                match = pattern.search(text)
+                if match:
+                    is_exclusion = True
+                    matched_pattern = match.group()
+                    break
+            
+            if is_exclusion:
+                excluded_texts.append((text[:40], matched_pattern))
+                
+                # Expand zone slightly to catch nearby numbers
+                x1, y1, x2, y2 = box
+                padding_x = (x2 - x1) * 0.3  # 30% horizontal padding
+                padding_y = (y2 - y1) * 0.5  # 50% vertical padding
+                
+                expanded_zone = (
+                    int(x1 - padding_x),
+                    int(y1 - padding_y),
+                    int(x2 + padding_x),
+                    int(y2 + padding_y)
+                )
+                exclusion_zones.append(expanded_zone)
+        
+        # Log excluded regions for transparency
+        if exclusion_zones:
+            logger.debug(f"[Negative Pattern Matching] Identified {len(exclusion_zones)} exclusion zones")
+            for text_preview, pattern in excluded_texts[:5]:  # Show first 5
+                logger.debug(f"  - Excluded: '{text_preview}...' (matched: '{pattern}')")
+        
+        return exclusion_zones
+    
+    def _is_in_exclusion_zone(
+        self,
+        box: List[int],
+        exclusion_zones: List[Tuple[int, int, int, int]] = None
+    ) -> bool:
+        """
+        Check if a bounding box overlaps with any exclusion zone.
+        
+        Args:
+            box: [x1, y1, x2, y2] bounding box to check
+            exclusion_zones: List of exclusion zones (uses cached if None)
+            
+        Returns:
+            True if box center is within an exclusion zone
+        """
+        zones = exclusion_zones if exclusion_zones is not None else self._exclusion_zones
+        
+        if not zones or not box:
+            return False
+        
+        # Calculate box center
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        
+        # Check against each exclusion zone
+        for ex1, ey1, ex2, ey2 in zones:
+            if ex1 <= cx <= ex2 and ey1 <= cy <= ey2:
+                return True
+        
+        return False
+    
+    def _filter_by_exclusion_zones(
+        self,
+        texts: List[str],
+        boxes: List[List[int]],
+        exclusion_zones: List[Tuple[int, int, int, int]] = None
+    ) -> Tuple[List[str], List[List[int]]]:
+        """
+        Filter out text elements that fall within exclusion zones.
+        
+        Returns:
+            Filtered (texts, boxes) tuple with exclusion zone elements removed
+        """
+        zones = exclusion_zones if exclusion_zones is not None else self._exclusion_zones
+        
+        if not zones:
+            return texts, boxes
+        
+        filtered_texts = []
+        filtered_boxes = []
+        
+        for text, box in zip(texts, boxes):
+            if not self._is_in_exclusion_zone(box, zones):
+                filtered_texts.append(text)
+                filtered_boxes.append(box)
+        
+        return filtered_texts, filtered_boxes
     
     def extract_all(self, ocr_result: Dict) -> Dict:
         """
         Extract all fields using hybrid visual-textual analysis.
         
         Enhanced extraction with:
-        1. Spatial key-value pair detection
-        2. Table structure analysis
-        3. Region-based contextual extraction
-        4. Pattern matching fallback
+        1. **Negative Pattern Matching** - Identify exclusion zones first
+        2. Spatial key-value pair detection
+        3. Table structure analysis
+        4. Region-based contextual extraction
+        5. Pattern matching fallback
         
         Args:
             ocr_result: Dict with 'texts', 'boxes', 'full_text' from OCR
@@ -160,14 +359,31 @@ class FieldParser:
         texts = ocr_result.get('texts', [])
         boxes = ocr_result.get('boxes', [])
         
+        # === STEP 0: Identify Exclusion Zones (Negative Pattern Matching) ===
+        # This preemptively marks address/contact regions to avoid extracting
+        # PIN codes, phone numbers, etc. as prices or other numeric fields
+        logger.debug("Starting Negative Pattern Matching to identify exclusion zones...")
+        self._exclusion_zones = self._identify_exclusion_zones(texts, boxes)
+        
+        # Create filtered text for numeric extraction (HP, Cost)
+        # Dealer/Model extraction uses full text since they're in different regions
+        filtered_texts, filtered_boxes = self._filter_by_exclusion_zones(texts, boxes)
+        filtered_full_text = ' '.join(filtered_texts)
+        
+        filter_ratio = len(filtered_texts) / max(len(texts), 1)
+        logger.debug(f"  → Text elements: {len(texts)} total, {len(filtered_texts)} after filtering ({filter_ratio:.0%})")
+        
         # Build spatial index for key-value detection
         text_elements = list(zip(texts, boxes)) if texts and boxes else []
+        filtered_elements = list(zip(filtered_texts, filtered_boxes)) if filtered_texts else []
         
-        # Detect key-value pairs spatially
+        # Detect key-value pairs spatially (use filtered for numeric fields)
         kv_pairs = self._detect_key_value_pairs(text_elements)
+        filtered_kv_pairs = self._detect_key_value_pairs(filtered_elements)
         
         # Detect table structures
         table_data = self._detect_table_structure(text_elements)
+        filtered_table_data = self._detect_table_structure(filtered_elements)
         
         # Extract using multiple strategies
         results = {}
@@ -191,23 +407,23 @@ class FieldParser:
             ]
         )
         
-        # === HORSE POWER ===
+        # === HORSE POWER (use filtered data to avoid address regions) ===
         results['horse_power'] = self._extract_with_fallback(
             'horse_power',
             [
-                lambda: self._extract_hp_from_table(table_data),
-                lambda: self._extract_from_kv(kv_pairs, 'horse_power'),
-                lambda: self.extract_hp(full_text)
+                lambda: self._extract_hp_from_table(filtered_table_data),
+                lambda: self._extract_from_kv(filtered_kv_pairs, 'horse_power'),
+                lambda: self.extract_hp(filtered_full_text)
             ]
         )
         
-        # === ASSET COST ===
+        # === ASSET COST (use filtered data to avoid PIN codes) ===
         results['asset_cost'] = self._extract_with_fallback(
             'asset_cost',
             [
-                lambda: self._extract_cost_from_table(table_data),
-                lambda: self._extract_from_kv(kv_pairs, 'asset_cost'),
-                lambda: self.extract_cost(full_text)
+                lambda: self._extract_cost_from_table(filtered_table_data),
+                lambda: self._extract_from_kv(filtered_kv_pairs, 'asset_cost'),
+                lambda: self.extract_cost(filtered_full_text)
             ]
         )
         
@@ -508,13 +724,17 @@ class FieldParser:
         
         Returns: (value, confidence) or (None, 0.0)
         """
+        valid_costs = []
+        
         # Try labeled patterns first (most reliable)
         for pattern in self._cost_compiled[:4]:  # First 4 are labeled patterns
             matches = pattern.findall(text)
             for match in matches:
                 cost = self._parse_indian_number(match)
                 if cost and 50000 <= cost <= 5000000:
-                    return (cost, 0.9)
+                    # Filter out PIN codes
+                    if not self._is_likely_pin_code(cost, text):
+                        return (cost, 0.9)
         
         # Try currency patterns
         for pattern in self._cost_compiled[4:]:
@@ -522,20 +742,36 @@ class FieldParser:
             for match in matches:
                 cost = self._parse_indian_number(match)
                 if cost and 50000 <= cost <= 5000000:
-                    return (cost, 0.8)
+                    # Filter out PIN codes
+                    if not self._is_likely_pin_code(cost, text):
+                        valid_costs.append((cost, 0.8))
         
-        # Fallback: find large numbers in Indian format
-        large_nums = re.findall(r'(\d{1,2}[,\.]?\d{2}[,\.]?\d{3})', text)
-        valid_costs = []
+        # If we found valid costs from currency patterns, return the largest
+        if valid_costs:
+            valid_costs.sort(key=lambda x: x[0], reverse=True)
+            return valid_costs[0]
         
-        for num in large_nums:
+        # Fallback: find large numbers in Indian format (with commas - typical price format)
+        # Prefer numbers with Indian comma formatting (X,XX,XXX) over plain 6-digit numbers
+        indian_format_nums = re.findall(r'(\d{1,2},\d{2},\d{3})', text)
+        for num in indian_format_nums:
             cost = self._parse_indian_number(num)
             if cost and 50000 <= cost <= 5000000:
-                valid_costs.append(cost)
+                if not self._is_likely_pin_code(cost, text):
+                    valid_costs.append((cost, 0.7))
+        
+        # Also check for plain large numbers, but with lower confidence
+        plain_nums = re.findall(r'(?<![,\d])(\d{5,7})(?![,\d])', text)
+        for num in plain_nums:
+            cost = self._parse_indian_number(num)
+            if cost and 50000 <= cost <= 5000000:
+                if not self._is_likely_pin_code(cost, text):
+                    valid_costs.append((cost, 0.5))
         
         if valid_costs:
-            # Take the largest as it's likely the total
-            return (max(valid_costs), 0.6)
+            # Sort by confidence first, then by value (prefer larger amounts)
+            valid_costs.sort(key=lambda x: (x[1], x[0]), reverse=True)
+            return valid_costs[0]
         
         return (None, 0.0)
     
@@ -549,6 +785,61 @@ class FieldParser:
             return int(cleaned)
         except ValueError:
             return None
+    
+    def _is_likely_pin_code(self, number: int, full_text: str) -> bool:
+        """
+        Check if a number is likely a PIN code rather than a price.
+        
+        Indian PIN codes are 6-digit numbers (100000-999999).
+        We check context to determine if the number appears near address keywords.
+        """
+        # PIN codes are exactly 6 digits
+        if not (100000 <= number <= 999999):
+            return False
+        
+        num_str = str(number)
+        
+        # Check if number appears in PIN code context
+        for pattern in self._pin_context_compiled:
+            if pattern.search(full_text):
+                # Check if this specific number is in the match
+                matches = pattern.findall(full_text)
+                for match in matches:
+                    if num_str in str(match):
+                        return True
+        
+        # Check proximity to address keywords
+        address_keywords = [
+            'dist', 'district', 'pin', 'pincode', 'taluka', 'tehsil', 'block',
+            'road', 'street', 'nagar', 'colony', 'sector', 'phase',
+            'raj', 'rajasthan', 'gujarat', 'maharashtra', 'mp', 'up',
+            'contact', 'contect', 'phone', 'mobile', 'email', 'e-mail',
+            'address', 'location', 'office'
+        ]
+        
+        # Find the number in text and check surrounding context (100 chars)
+        for match in re.finditer(re.escape(num_str), full_text, re.IGNORECASE):
+            start = max(0, match.start() - 100)
+            end = min(len(full_text), match.end() + 50)
+            context = full_text[start:end].lower()
+            
+            if any(kw in context for kw in address_keywords):
+                return True
+        
+        # Check if the number doesn't have typical price formatting (commas)
+        # Prices are usually written as 5,50,000 or 5,25,000, PIN codes as 306115
+        price_formatted = re.search(rf'\d{{1,2}},\d{{2}},?{num_str[-3:]}', full_text)
+        if not price_formatted:
+            # Number appears without Indian price formatting, more likely PIN
+            plain_match = re.search(rf'(?<![,\d]){num_str}(?![,\d])', full_text)
+            if plain_match:
+                # Check if near address-like patterns
+                start = max(0, plain_match.start() - 80)
+                context = full_text[start:plain_match.end()].lower()
+                if any(kw in context for kw in ['dist', 'pin', 'raj', 'road', 'contect', 'contact']):
+                    return True
+        
+        return False
     
     def extract_model(self, text: str, texts: List[str] = None) -> Tuple[Optional[str], float]:
         """
@@ -581,7 +872,8 @@ class FieldParser:
         if not model:
             return model
         
-        # Capitalize brand names properly
+        # Capitalize brand names properly (also fix OCR misreads)
+        model = re.sub(r'\b(?:solis|solus|s0lis)\b', 'Solis', model, flags=re.IGNORECASE)
         model = re.sub(r'\bmahindra\b', 'Mahindra', model, flags=re.IGNORECASE)
         model = re.sub(r'\bjohn\s*deere\b', 'John Deere', model, flags=re.IGNORECASE)
         model = re.sub(r'\btafe\b', 'TAFE', model, flags=re.IGNORECASE)
@@ -589,6 +881,8 @@ class FieldParser:
         model = re.sub(r'\bsonalika\b', 'Sonalika', model, flags=re.IGNORECASE)
         model = re.sub(r'\bmassey\s*ferguson\b', 'Massey Ferguson', model, flags=re.IGNORECASE)
         model = re.sub(r'\bnew\s*holland\b', 'New Holland', model, flags=re.IGNORECASE)
+        model = re.sub(r'\b2wd\b', '2WD', model, flags=re.IGNORECASE)
+        model = re.sub(r'\b4wd\b', '4WD', model, flags=re.IGNORECASE)
         
         return model.strip()
     
@@ -605,6 +899,7 @@ class FieldParser:
         1. Look for labeled dealer name
         2. Find business names in header region
         3. Pattern match company names
+        4. Look for prominent uppercase names with business keywords
         
         Returns: (value, confidence) or (None, 0.0)
         """
@@ -617,8 +912,8 @@ class FieldParser:
                 if len(dealer) > 3 and not dealer.isdigit():
                     return (dealer, 0.95)
         
-        # Strategy 2: Check header lines (first 5-7 lines) for business names
-        for line in texts[:7]:
+        # Strategy 2: Check header lines (first 10 lines) for business names
+        for line in texts[:10]:
             line_lower = line.lower()
             
             # Check for business suffixes
@@ -627,8 +922,9 @@ class FieldParser:
                 if dealer and len(dealer) > 5:
                     return (dealer, 0.85)
         
-        # Strategy 3: Pattern match company names anywhere
+        # Strategy 3: Pattern match company names anywhere (case-insensitive)
         company_patterns = [
+            r'([A-Za-z][A-Za-z\s&]+(?:TRACTOR|Tractor|TRACTORS|Tractors|MOTORS|Motors|AUTO|Auto|AGENCIES|Agencies|ENTERPRISES|Enterprises))',
             r'([A-Z][A-Za-z\s&]+(?:Tractors?|Motors?|Auto|Agencies|Enterprises)[A-Za-z\s&]*(?:Pvt\.?|Private)?\.?\s*(?:Ltd\.?|Limited)?)',
             r'([A-Z][A-Za-z\s]+(?:Pvt\.?|Private)\s*(?:Ltd\.?|Limited))',
         ]
@@ -640,10 +936,18 @@ class FieldParser:
                 if dealer and len(dealer) > 5:
                     return (dealer, 0.75)
         
-        # Strategy 4: First line often contains dealer name (letterhead)
+        # Strategy 4: Look for uppercase words with TRACTOR/MOTOR in text
+        uppercase_pattern = r'\b([A-Z][A-Z\s]+(?:TRACTOR|MOTOR|AUTO)[A-Z\s]*)\b'
+        match = re.search(uppercase_pattern, text)
+        if match:
+            dealer = match.group(1).strip().title()
+            if len(dealer) > 5:
+                return (dealer, 0.7)
+        
+        # Strategy 5: First line often contains dealer name (letterhead)
         if texts and len(texts[0]) > 5:
             first_line = texts[0].strip()
-            if not first_line.isdigit() and not re.match(r'^(Date|Invoice|Quotation)', first_line, re.I):
+            if not first_line.isdigit() and not re.match(r'^(Date|Invoice|Quotation|GST|Bill)', first_line, re.I):
                 return (first_line, 0.6)
         
         return (None, 0.0)

@@ -1,0 +1,30 @@
+{
+  "doc_id": "90019757162_OTHERS_v1_pg1",
+  "fields": {
+    "dealer_name": "Jagalur Mahalingappa Enterprises",
+    "model_name": "Massey Ferguson 1035 DI",
+    "horse_power": 39,
+    "asset_cost": 700000,
+    "signature": {
+      "present": true,
+      "bbox": [
+        12,
+        758,
+        1183,
+        1140
+      ]
+    },
+    "stamp": {
+      "present": true,
+      "bbox": [
+        55,
+        43,
+        142,
+        90
+      ]
+    }
+  },
+  "confidence": 0.9,
+  "processing_time_sec": 48.1,
+  "cost_estimate_usd": 0.0097
+}

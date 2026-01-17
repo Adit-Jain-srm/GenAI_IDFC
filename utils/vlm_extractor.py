@@ -24,10 +24,17 @@ from loguru import logger
 # Lazy imports for resource efficiency
 QWEN_AVAILABLE = False
 OPENAI_AVAILABLE = False
+AZURE_OPENAI_AVAILABLE = False
 
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
+except ImportError:
+    pass
+
+try:
+    from openai import AzureOpenAI
+    AZURE_OPENAI_AVAILABLE = True
 except ImportError:
     pass
 
@@ -62,6 +69,9 @@ ACCURACY STANDARDS:
         provider: str = 'openai',
         model_name: str = 'gpt-4o-mini',
         api_key: Optional[str] = None,
+        azure_endpoint: Optional[str] = None,
+        azure_deployment: Optional[str] = None,
+        azure_api_version: str = '2024-02-15-preview',
         max_tokens: int = 1500,
         temperature: float = 0.1
     ):
@@ -70,6 +80,11 @@ ACCURACY STANDARDS:
         self.max_tokens = max_tokens
         self.temperature = temperature
         
+        # Azure-specific settings
+        self.azure_endpoint = azure_endpoint
+        self.azure_deployment = azure_deployment
+        self.azure_api_version = azure_api_version
+        
         self.model = None
         self.processor = None
         self.client = None
@@ -77,6 +92,8 @@ ACCURACY STANDARDS:
         
         if provider == 'openai':
             self._init_openai(api_key)
+        elif provider == 'azure':
+            self._init_azure(api_key)
         elif provider == 'qwen':
             self._init_qwen()
     
@@ -90,6 +107,33 @@ ACCURACY STANDARDS:
             raise ValueError("OPENAI_API_KEY required")
         
         self.client = OpenAI(api_key=api_key)
+    
+    def _init_azure(self, api_key: Optional[str]):
+        """Initialize Azure OpenAI client."""
+        if not AZURE_OPENAI_AVAILABLE:
+            raise ImportError("OpenAI package required: pip install openai>=1.0.0")
+        
+        # Get credentials from params or environment
+        api_key = api_key or os.environ.get('AZURE_OPENAI_API_KEY')
+        endpoint = self.azure_endpoint or os.environ.get('AZURE_OPENAI_ENDPOINT')
+        deployment = self.azure_deployment or os.environ.get('AZURE_OPENAI_DEPLOYMENT')
+        api_version = self.azure_api_version or os.environ.get('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
+        
+        if not api_key:
+            raise ValueError("AZURE_OPENAI_API_KEY required (env var or --azure_api_key)")
+        if not endpoint:
+            raise ValueError("AZURE_OPENAI_ENDPOINT required (env var or --azure_endpoint)")
+        if not deployment:
+            raise ValueError("AZURE_OPENAI_DEPLOYMENT required (env var or --azure_deployment)")
+        
+        self.client = AzureOpenAI(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=endpoint
+        )
+        # Use deployment name as model name for Azure
+        self.model_name = deployment
+        logger.info(f"Azure OpenAI initialized: endpoint={endpoint}, deployment={deployment}")
     
     def _init_qwen(self):
         """Initialize Qwen model (lazy load)."""
@@ -118,7 +162,7 @@ ACCURACY STANDARDS:
         """
         prompt = self._get_extraction_prompt()
         
-        if self.provider == 'openai':
+        if self.provider in ('openai', 'azure'):
             return self._extract_openai(image, prompt)
         else:
             return self._extract_qwen(image, prompt)
@@ -172,9 +216,12 @@ First, analyze the document structure:
 
 3. **HORSE POWER** - Look for:
    - Often in a specifications table or near model name
-   - Number followed by "HP", "hp", "Horse Power", "BHP"
+   - Number followed by "HP", "hp", "Horse Power", "BHP", "H.P."
    - May be in a column labeled "Power" or "Engine"
    - Valid range: 15-150 HP for tractors
+   - **OFTEN HANDWRITTEN** - Look for handwritten numbers near "H.P." or "HP" text
+   - May appear inline with model: "SWARAJ 744 FE TRACTOR .....25..... H.P."
+   - Common values: 25, 30, 35, 40, 45, 50, 55, 60, 65, 75, 90 HP
    - Hindi: "अश्वशक्ति", "एचपी" | Gujarati: "એચપી", "અશ્વશક્તિ"
 
 4. **ASSET COST** - Look for:
@@ -184,7 +231,15 @@ First, analyze the document structure:
    - Indian format: ₹5,25,000 or Rs. 5,25,000/- means 525000
    - Valid range: ₹50,000 - ₹50,00,000
    - Often bold or highlighted
+   - Look for handwritten amounts - they are often the final price
    - Hindi: "कुल", "राशि", "मूल्य" | Gujarati: "કુલ", "કિંમત"
+   
+   ⚠️ **CRITICAL - DO NOT CONFUSE WITH PIN CODES:**
+   - Indian PIN codes are 6-digit numbers (e.g., 306115, 382010)
+   - PIN codes appear in ADDRESS sections near: "Dist.", "District", city names, "Rajasthan", "Gujarat", etc.
+   - Example: "RANI - 306115, Dist.-Pali (Raj.)" → 306115 is a PIN code, NOT a price
+   - Prices have ₹/Rs. prefix and appear near "Total", "Amount", "Price" labels
+   - When in doubt, prefer the larger number with price formatting (commas like 5,50,000)
 
 ===== FEW-SHOT EXAMPLES =====
 
@@ -207,6 +262,11 @@ Output: {"dealer_name": "Patel Tractors", "model_name": "Sonalika DI 50", "horse
 Example 5 - Partial Information (Low Quality):
 Input: Scanned document with dealer name and model clearly visible, but HP section is blurry and multiple price values shown without clear total
 Output: {"dealer_name": "ABC Motors", "model_name": "Swaraj 744 FE", "horse_power": null, "asset_cost": null, "confidence": 0.55, "extraction_notes": "HP illegible, cost ambiguous - multiple values without clear total"}
+
+Example 6 - PIN Code vs Price (IMPORTANT):
+Input: Header shows "KISSAN TRACTOR AGENCY, Kenpura Road, RANI - 306115, Dist.-Pali (Raj.)". Body shows "SWARAJ 744 FE TRACTOR ...25... H.P." with handwritten "25". Price section shows "Rs. 5,50,600" and "Total Amount Rs.: 5,50,000/-"
+Output: {"dealer_name": "Kissan Tractor Agency", "model_name": "Swaraj 744 FE", "horse_power": 25, "asset_cost": 550000, "confidence": 0.90, "extraction_notes": "306115 is PIN code in address, not price. Used handwritten total amount."}
+WRONG: {"asset_cost": 306115} ← This is the PIN code from address, NOT the price!
 
 ===== OUTPUT FORMAT =====
 
@@ -414,6 +474,11 @@ Now analyze the provided document image and extract the fields:"""
             validated['horse_power'] = None
         
         # Asset cost - validate range and clean
+        # Note: PIN code filtering is NOT applied here because:
+        # 1. VLM prompt explicitly instructs to distinguish PIN codes from prices
+        # 2. Valid tractor prices can be ₹3-4 lakhs (300000-400000) for entry-level models
+        # 3. Threshold-based filtering incorrectly rejects valid prices
+        # The VLM's contextual understanding is trusted for this distinction
         cost = result.get('asset_cost')
         if cost is not None:
             try:
@@ -421,6 +486,8 @@ Now analyze the provided document image and extract the fields:"""
                 if isinstance(cost, str):
                     cost = cost.replace(',', '').replace('₹', '').replace('Rs', '').strip()
                 cost = int(float(cost))
+                
+                # Validate range only - trust VLM for PIN vs price distinction
                 validated['asset_cost'] = cost if 50000 <= cost <= 5000000 else None
             except (ValueError, TypeError):
                 validated['asset_cost'] = None

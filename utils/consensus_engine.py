@@ -75,11 +75,52 @@ class ConsensusEngine:
     PSEUDO_LABEL_THRESHOLD = 0.85  # Minimum confidence to generate pseudo-label
     CONSENSUS_THRESHOLD = 0.7     # Minimum agreement for consensus
     
+    # ============ FIELD-SPECIFIC TRUST WEIGHTS ============
+    # Adaptive trust scores based on typical accuracy of each method per field
+    # These weights are empirically tuned for tractor invoice processing:
+    # 
+    # **Key Insight**: Different fields require different extraction strategies
+    # - Rule-based excels at: Printed text, structured layouts, known patterns
+    # - VLM excels at: Handwritten text, complex layouts, contextual understanding
+    #
+    # Trust Weight Impact:
+    # - Weight > 1.0: Method is preferred for this field
+    # - Weight = 1.0: Neutral (standard confidence)
+    # - Weight < 1.0: Method is less trusted for this field
+    #
+    FIELD_METHOD_TRUST = {
+        'dealer_name': {
+            'rule_based': 1.0,   # Usually printed in header, OCR reliable
+            'vlm': 0.85,         # VLM good but may over-interpret or hallucinate
+        },
+        'model_name': {
+            'rule_based': 0.75,  # Pattern matching limited to known brands
+            'vlm': 1.0,          # VLM better at reading full model with variants
+        },
+        'horse_power': {
+            'rule_based': 0.5,   # Often handwritten, high OCR noise
+            'vlm': 1.1,          # VLM excels at reading handwritten numbers (boosted)
+        },
+        'asset_cost': {
+            'rule_based': 0.4,   # Almost always handwritten, high PIN code risk
+            'vlm': 1.15,         # VLM excels, understands context (PIN vs price) (boosted)
+        },
+    }
+    
+    # Document trait adjustments
+    TRAIT_ADJUSTMENTS = {
+        'has_handwriting': {'rule_based': 0.7, 'vlm': 1.2},
+        'is_hindi': {'rule_based': 0.9, 'vlm': 1.0},
+        'is_gujarati': {'rule_based': 0.85, 'vlm': 1.0},
+        'low_quality': {'rule_based': 0.6, 'vlm': 0.9},
+    }
+    
     def __init__(
         self,
         min_voters: int = 2,
         confidence_weight: bool = True,
-        use_deterministic_boost: bool = True
+        use_deterministic_boost: bool = True,
+        use_field_trust_weights: bool = True
     ):
         """
         Initialize consensus engine.
@@ -87,11 +128,16 @@ class ConsensusEngine:
         Args:
             min_voters: Minimum extraction methods for consensus
             confidence_weight: Weight votes by confidence scores
+            use_field_trust_weights: Apply field-specific trust weights to methods
             use_deterministic_boost: Boost confidence for deterministic matches
         """
         self.min_voters = min_voters
         self.confidence_weight = confidence_weight
         self.use_deterministic_boost = use_deterministic_boost
+        self.use_field_trust_weights = use_field_trust_weights
+        
+        # Document-level traits (detected per document)
+        self._document_traits = {}
         
         # Compile deterministic patterns
         self._compiled_rules = {}
@@ -102,10 +148,134 @@ class ConsensusEngine:
                 'confidence_boost': rules.get('confidence_boost', 0)
             }
     
+    # ============ FIELD-SPECIFIC TRUST WEIGHTS ============
+    
+    def detect_document_traits(self, ocr_result: Dict) -> Dict[str, bool]:
+        """
+        Detect document characteristics to adjust trust weights.
+        
+        Traits detected:
+        - has_handwriting: Document contains handwritten text
+        - is_hindi: Significant Hindi text present
+        - is_gujarati: Significant Gujarati text present
+        - low_quality: Poor image/OCR quality
+        
+        Returns:
+            Dict of trait_name -> bool
+        """
+        traits = {
+            'has_handwriting': False,
+            'is_hindi': False,
+            'is_gujarati': False,
+            'low_quality': False,
+        }
+        
+        full_text = ocr_result.get('full_text', '')
+        confidences = ocr_result.get('confidences', [])
+        
+        # Detect handwriting indicators
+        # - Irregular character spacing (lots of single chars or OCR fragments)
+        # - Mixed case inconsistency
+        # - OCR noise patterns
+        if full_text:
+            words = full_text.split()
+            single_char_ratio = sum(1 for w in words if len(w) == 1) / max(len(words), 1)
+            noise_chars = sum(1 for c in full_text if c in '^`~_|\\')
+            
+            if single_char_ratio > 0.15 or noise_chars > 10:
+                traits['has_handwriting'] = True
+        
+        # Detect language
+        hindi_chars = sum(1 for c in full_text if '\u0900' <= c <= '\u097F')
+        gujarati_chars = sum(1 for c in full_text if '\u0A80' <= c <= '\u0AFF')
+        
+        if hindi_chars > 20:
+            traits['is_hindi'] = True
+        if gujarati_chars > 20:
+            traits['is_gujarati'] = True
+        
+        # Detect low quality
+        if confidences:
+            avg_conf = sum(confidences) / len(confidences)
+            if avg_conf < 0.7:
+                traits['low_quality'] = True
+        
+        self._document_traits = traits
+        return traits
+    
+    def get_field_trust_weight(
+        self,
+        field: str,
+        method_name: str,
+        traits: Dict[str, bool] = None
+    ) -> float:
+        """
+        Calculate trust weight for a specific field-method combination.
+        
+        Args:
+            field: Field name (e.g., 'horse_power', 'asset_cost')
+            method_name: Extraction method name ('rule_based', 'vlm')
+            traits: Document traits (uses cached if None)
+            
+        Returns:
+            Trust weight multiplier (0.5 to 1.5)
+        """
+        traits = traits if traits is not None else self._document_traits
+        
+        # Get base trust weight for this field-method combination
+        method_type = 'vlm' if 'vlm' in method_name.lower() else 'rule_based'
+        field_trust = self.FIELD_METHOD_TRUST.get(field, {})
+        base_weight = field_trust.get(method_type, 0.8)
+        
+        # Apply trait adjustments
+        if traits:
+            for trait_name, is_present in traits.items():
+                if is_present and trait_name in self.TRAIT_ADJUSTMENTS:
+                    adjustment = self.TRAIT_ADJUSTMENTS[trait_name].get(method_type, 1.0)
+                    base_weight *= adjustment
+        
+        # Clamp to reasonable range
+        return max(0.3, min(1.5, base_weight))
+    
+    def apply_trust_weights_to_votes(
+        self,
+        field: str,
+        votes: List[Tuple[Any, float, str]],
+        traits: Dict[str, bool] = None
+    ) -> List[Tuple[Any, float, str]]:
+        """
+        Apply field-specific trust weights to vote confidences.
+        
+        Args:
+            field: Field being voted on
+            votes: List of (value, confidence, method_name) tuples
+            traits: Document traits for adjustment
+            
+        Returns:
+            Weighted votes with adjusted confidences
+        """
+        if not self.use_field_trust_weights:
+            return votes
+        
+        weighted_votes = []
+        for value, confidence, method_name in votes:
+            trust_weight = self.get_field_trust_weight(field, method_name, traits)
+            weighted_confidence = min(1.0, confidence * trust_weight)
+            weighted_votes.append((value, weighted_confidence, method_name))
+            
+            if trust_weight != 1.0:
+                logger.debug(
+                    f"  Trust weight [{field}][{method_name}]: "
+                    f"{confidence:.2f} * {trust_weight:.2f} = {weighted_confidence:.2f}"
+                )
+        
+        return weighted_votes
+    
     def extract_with_consensus(
         self,
         extraction_methods: List[Callable],
-        method_names: List[str] = None
+        method_names: List[str] = None,
+        ocr_result: Dict = None
     ) -> Dict[str, Tuple[Any, float, Dict]]:
         """
         Run multiple extraction methods and return consensus results.
@@ -113,6 +283,7 @@ class ConsensusEngine:
         Args:
             extraction_methods: List of callables that return Dict[field: (value, confidence)]
             method_names: Names for logging/debugging
+            ocr_result: OCR result dict for trait detection (enables adaptive trust weights)
             
         Returns:
             Dict with field -> (consensus_value, confidence, metadata)
@@ -121,6 +292,16 @@ class ConsensusEngine:
             return {}
         
         method_names = method_names or [f"method_{i}" for i in range(len(extraction_methods))]
+        
+        # Detect document traits for adaptive trust weighting
+        # Traits affect how much we trust each method (rule-based vs VLM)
+        traits = None
+        if ocr_result and self.use_field_trust_weights:
+            traits = self.detect_document_traits(ocr_result)
+            active_traits = [k for k, v in traits.items() if v]
+            if active_traits:
+                logger.info(f"  Document traits detected: {active_traits}")
+                logger.debug(f"  → Trust adjustments will be applied to voting weights")
         
         # Collect results from all methods
         all_results = []
@@ -143,13 +324,29 @@ class ConsensusEngine:
                 return self._convert_to_consensus_format(all_results[0]['results'])
             return {}
         
-        # Apply consensus voting for each field
+        # Apply consensus voting for each field with field-specific trust weights
         consensus = {}
         fields = ['dealer_name', 'model_name', 'horse_power', 'asset_cost']
         
+        logger.debug("[Field-Specific Trust Weights] Applying adaptive weights to votes:")
+        
         for field in fields:
             field_votes = self._collect_field_votes(all_results, field)
-            consensus[field] = self._vote_on_field(field, field_votes)
+            
+            # Apply field-specific trust weights before voting
+            # This gives VLM more weight for handwritten fields (HP, cost)
+            # and rule-based more weight for printed fields (dealer)
+            weighted_votes = self.apply_trust_weights_to_votes(field, field_votes, traits)
+            
+            # Log the weight adjustments
+            if field_votes:
+                logger.debug(f"  {field}:")
+                for (val, orig_conf, method), (_, new_conf, _) in zip(field_votes, weighted_votes):
+                    if orig_conf != new_conf:
+                        method_type = 'VLM' if 'vlm' in method.lower() else 'Rule-based'
+                        logger.debug(f"    → {method_type}: {val} [{orig_conf:.2f} → {new_conf:.2f}]")
+            
+            consensus[field] = self._vote_on_field(field, weighted_votes)
         
         return consensus
     
