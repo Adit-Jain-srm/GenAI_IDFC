@@ -508,15 +508,29 @@ class OCREngine:
         self,
         texts: List[str],
         boxes: List[List[int]],
-        y_tolerance: int = 15
+        y_tolerance: int = None  # Now computed adaptively if not provided
     ) -> List[Dict]:
         """
         Group text into logical lines based on y-coordinates.
+        
+        Uses ADAPTIVE y_tolerance based on median text height for resolution independence.
         
         Returns list of lines with text and bounding box.
         """
         if not texts:
             return []
+        
+        # === ADAPTIVE Y-TOLERANCE ===
+        # Compute from median text height if not explicitly provided
+        if y_tolerance is None:
+            heights = [abs(b[3] - b[1]) for b in boxes if len(b) >= 4 and b[3] > b[1]]
+            if heights:
+                heights.sort()
+                median_height = heights[len(heights) // 2]
+                # Use 50% of median text height as tolerance
+                y_tolerance = max(5, int(median_height * 0.5))
+            else:
+                y_tolerance = 15  # Fallback
         
         # Sort by y-coordinate
         elements = sorted(zip(texts, boxes), key=lambda x: (x[1][1], x[1][0]))

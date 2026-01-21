@@ -216,6 +216,45 @@ class FieldParser:
         
         # Cache for exclusion zones (reset per document)
         self._exclusion_zones = []
+        
+        # ============ ADAPTIVE SPATIAL ANALYSIS ============
+        # These values are computed per-document from OCR boxes
+        # Using median_text_height as the universal unit scales with resolution/font size
+        self._median_text_height = 20  # Default fallback (will be computed per doc)
+        self._median_text_width = 100  # Default fallback
+    
+    def _compute_adaptive_metrics(self, boxes: List[List[int]]) -> None:
+        """
+        Compute adaptive spatial metrics from OCR boxes.
+        
+        Uses median text height as the universal unit of measurement.
+        This naturally scales with document resolution and font size.
+        """
+        if not boxes:
+            return
+        
+        heights = []
+        widths = []
+        
+        for box in boxes:
+            if len(box) >= 4:
+                h = abs(box[3] - box[1])
+                w = abs(box[2] - box[0])
+                if h > 0:
+                    heights.append(h)
+                if w > 0:
+                    widths.append(w)
+        
+        if heights:
+            # Use median to be robust against outliers (headers, footers)
+            heights.sort()
+            self._median_text_height = heights[len(heights) // 2]
+        
+        if widths:
+            widths.sort()
+            self._median_text_width = widths[len(widths) // 2]
+        
+        logger.debug(f"Adaptive metrics: median_text_height={self._median_text_height}px, median_text_width={self._median_text_width}px")
     
     # ============ NEGATIVE PATTERN MATCHING (EXCLUSION ZONES) ============
     
@@ -279,34 +318,62 @@ class FieldParser:
         
         return exclusion_zones
     
+    def _calculate_iou(self, box1: List[int], box2: Tuple[int, int, int, int]) -> float:
+        """
+        Calculate Intersection over Union (IoU) between two boxes.
+        
+        Args:
+            box1: [x1, y1, x2, y2] first bounding box
+            box2: (x1, y1, x2, y2) second bounding box
+            
+        Returns:
+            IoU value between 0.0 and 1.0
+        """
+        # Calculate intersection
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        if x1 >= x2 or y1 >= y2:
+            return 0.0
+        
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
     def _is_in_exclusion_zone(
         self,
         box: List[int],
-        exclusion_zones: List[Tuple[int, int, int, int]] = None
+        exclusion_zones: List[Tuple[int, int, int, int]] = None,
+        iou_threshold: float = 0.1
     ) -> bool:
         """
         Check if a bounding box overlaps with any exclusion zone.
         
+        Uses IoU (Intersection over Union) for robust overlap detection
+        instead of center-only check. Any significant overlap triggers exclusion.
+        
         Args:
             box: [x1, y1, x2, y2] bounding box to check
             exclusion_zones: List of exclusion zones (uses cached if None)
+            iou_threshold: Minimum IoU to consider as overlap (default 0.1 = 10%)
             
         Returns:
-            True if box center is within an exclusion zone
+            True if box has significant overlap with any exclusion zone
         """
         zones = exclusion_zones if exclusion_zones is not None else self._exclusion_zones
         
         if not zones or not box:
             return False
         
-        # Calculate box center
-        x1, y1, x2, y2 = box
-        cx = (x1 + x2) / 2
-        cy = (y1 + y2) / 2
-        
-        # Check against each exclusion zone
-        for ex1, ey1, ex2, ey2 in zones:
-            if ex1 <= cx <= ex2 and ey1 <= cy <= ey2:
+        # Check IoU against each exclusion zone
+        for zone in zones:
+            iou = self._calculate_iou(box, zone)
+            if iou >= iou_threshold:
                 return True
         
         return False
@@ -358,6 +425,10 @@ class FieldParser:
         full_text = ocr_result.get('full_text', '')
         texts = ocr_result.get('texts', [])
         boxes = ocr_result.get('boxes', [])
+        
+        # === ADAPTIVE SPATIAL METRICS ===
+        # Compute document-specific metrics for resolution-independent analysis
+        self._compute_adaptive_metrics(boxes)
         
         # === STEP 0: Identify Exclusion Zones (Negative Pattern Matching) ===
         # This preemptively marks address/contact regions to avoid extracting
@@ -418,12 +489,14 @@ class FieldParser:
         )
         
         # === ASSET COST (use filtered data to avoid PIN codes) ===
+        # NOTE: Pass full_text as context_text so _is_likely_pin_code can detect
+        # address keywords even though extraction uses filtered text
         results['asset_cost'] = self._extract_with_fallback(
             'asset_cost',
             [
                 lambda: self._extract_cost_from_table(filtered_table_data),
                 lambda: self._extract_from_kv(filtered_kv_pairs, 'asset_cost'),
-                lambda: self.extract_cost(filtered_full_text)
+                lambda: self.extract_cost(filtered_full_text, context_text=full_text)
             ]
         )
         
@@ -491,6 +564,8 @@ class FieldParser:
         """
         Find value associated with a key based on spatial position.
         
+        Uses ADAPTIVE thresholds based on median_text_height for resolution independence.
+        
         Looks for values:
         1. On the same line, to the right of the key
         2. On the next line, below the key
@@ -506,6 +581,18 @@ class FieldParser:
         key_cx = (key_x1 + key_x2) / 2
         key_cy = (key_y1 + key_y2) / 2
         key_height = key_y2 - key_y1
+        key_width = key_x2 - key_x1
+        
+        # === ADAPTIVE THRESHOLDS ===
+        # Use median_text_height as the universal unit of measurement
+        # This scales naturally with document resolution and font size
+        mth = self._median_text_height
+        
+        # Max horizontal distance: ~8x median text height (adapts to resolution)
+        max_horizontal_distance = mth * 8
+        
+        # Alignment tolerance for "below" detection: ~1.5x key width
+        alignment_tolerance = max(key_width * 1.5, mth * 3)
         
         candidates = []
         
@@ -518,15 +605,20 @@ class FieldParser:
             cy = (y1 + y2) / 2
             
             # Check if on same line (y overlap) and to the right
+            # Use key_height for same-line detection (more precise than fixed threshold)
             if abs(cy - key_cy) < key_height * 0.8 and x1 > key_x2 - 10:
                 distance = x1 - key_x2
-                if distance < 300:  # Max horizontal distance
-                    candidates.append((text, 0.85, distance))
+                if distance < max_horizontal_distance:
+                    # Score: closer = higher confidence
+                    proximity_score = 1.0 - (distance / max_horizontal_distance)
+                    conf = 0.75 + (proximity_score * 0.15)  # 0.75 to 0.90
+                    candidates.append((text, conf, distance))
             
             # Check if on next line and aligned
-            elif y1 > key_y2 and y1 - key_y2 < key_height * 2:
-                if abs(cx - key_cx) < 100:  # Aligned below
-                    candidates.append((text, 0.75, y1 - key_y2))
+            elif y1 > key_y2 and y1 - key_y2 < key_height * 2.5:
+                if abs(cx - key_cx) < alignment_tolerance:
+                    vertical_distance = y1 - key_y2
+                    candidates.append((text, 0.70, vertical_distance))
         
         # Return closest candidate
         if candidates:
@@ -718,13 +810,26 @@ class FieldParser:
         
         return (None, 0.0)
     
-    def extract_cost(self, text: str) -> Tuple[Optional[int], float]:
+    def extract_cost(self, text: str, context_text: str = None) -> Tuple[Optional[int], float]:
         """
         Extract asset cost/price.
+        
+        Args:
+            text: Text to extract costs from (may be filtered to exclude address regions)
+            context_text: Original unfiltered text for PIN code context checking.
+                          If None, uses `text` for context (less accurate PIN detection).
+                          
+        IMPORTANT: PIN code detection requires address keywords like "Dist", "Pin", "Road"
+        to properly identify 6-digit numbers as PIN codes vs prices. If `text` has been
+        filtered to remove address regions, pass the original text as `context_text`.
         
         Returns: (value, confidence) or (None, 0.0)
         """
         valid_costs = []
+        
+        # Use original text for PIN context checking if provided
+        # This ensures address keywords are available even if text is filtered
+        pin_context = context_text if context_text is not None else text
         
         # Try labeled patterns first (most reliable)
         for pattern in self._cost_compiled[:4]:  # First 4 are labeled patterns
@@ -732,8 +837,8 @@ class FieldParser:
             for match in matches:
                 cost = self._parse_indian_number(match)
                 if cost and 50000 <= cost <= 5000000:
-                    # Filter out PIN codes
-                    if not self._is_likely_pin_code(cost, text):
+                    # Filter out PIN codes using full context text
+                    if not self._is_likely_pin_code(cost, pin_context):
                         return (cost, 0.9)
         
         # Try currency patterns
@@ -742,13 +847,13 @@ class FieldParser:
             for match in matches:
                 cost = self._parse_indian_number(match)
                 if cost and 50000 <= cost <= 5000000:
-                    # Filter out PIN codes
-                    if not self._is_likely_pin_code(cost, text):
+                    # Filter out PIN codes using full context text
+                    if not self._is_likely_pin_code(cost, pin_context):
                         valid_costs.append((cost, 0.8))
         
-        # If we found valid costs from currency patterns, return the largest
+        # If we found valid costs from currency patterns, return highest confidence (then largest)
         if valid_costs:
-            valid_costs.sort(key=lambda x: x[0], reverse=True)
+            valid_costs.sort(key=lambda x: (x[1], x[0]), reverse=True)
             return valid_costs[0]
         
         # Fallback: find large numbers in Indian format (with commas - typical price format)
@@ -757,7 +862,7 @@ class FieldParser:
         for num in indian_format_nums:
             cost = self._parse_indian_number(num)
             if cost and 50000 <= cost <= 5000000:
-                if not self._is_likely_pin_code(cost, text):
+                if not self._is_likely_pin_code(cost, pin_context):
                     valid_costs.append((cost, 0.7))
         
         # Also check for plain large numbers, but with lower confidence
@@ -765,7 +870,7 @@ class FieldParser:
         for num in plain_nums:
             cost = self._parse_indian_number(num)
             if cost and 50000 <= cost <= 5000000:
-                if not self._is_likely_pin_code(cost, text):
+                if not self._is_likely_pin_code(cost, pin_context):
                     valid_costs.append((cost, 0.5))
         
         if valid_costs:

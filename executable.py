@@ -54,7 +54,9 @@ class InvoiceExtractor:
     def __init__(
         self,
         use_vlm: bool = False,
-        vlm_provider: str = 'openai',
+        vlm_provider: str = 'qwen',  # Default to local Qwen (offline, no internet)
+        vlm_model: str = 'Qwen/Qwen2-VL-2B-Instruct',  # Fits easily in 16GB VRAM
+        use_4bit: bool = False,  # Enable for 7B model on limited VRAM
         yolo_model_path: Optional[str] = None,
         use_gpu: bool = True,
         azure_endpoint: Optional[str] = None,
@@ -67,7 +69,9 @@ class InvoiceExtractor:
         
         Args:
             use_vlm: Use Vision Language Model for enhanced extraction
-            vlm_provider: 'openai', 'azure', or 'qwen' (if use_vlm=True)
+            vlm_provider: 'qwen' (local, default), 'openai', or 'azure'
+            vlm_model: Model name for Qwen (e.g., 'Qwen/Qwen2.5-VL-2B-Instruct')
+            use_4bit: Enable 4-bit quantization for larger models on limited VRAM
             yolo_model_path: Path to trained YOLO model
             use_gpu: Use GPU acceleration where available
             azure_endpoint: Azure OpenAI endpoint URL
@@ -75,6 +79,10 @@ class InvoiceExtractor:
             azure_api_key: Azure OpenAI API key
             azure_api_version: Azure OpenAI API version
         """
+        # Store VLM settings
+        self.vlm_model = vlm_model
+        self.use_4bit = use_4bit
+        
         # Store Azure settings for VLM initialization
         self.azure_endpoint = azure_endpoint
         self.azure_deployment = azure_deployment
@@ -133,12 +141,14 @@ class InvoiceExtractor:
                 from utils.vlm_extractor import VLMExtractor
                 self._vlm = VLMExtractor(
                     provider=self.vlm_provider,
+                    model_name=self.vlm_model,
+                    use_4bit=self.use_4bit,
                     api_key=self.azure_api_key if self.vlm_provider == 'azure' else None,
                     azure_endpoint=self.azure_endpoint,
                     azure_deployment=self.azure_deployment,
                     azure_api_version=self.azure_api_version
                 )
-                logger.info(f"VLM loaded: {self.vlm_provider}")
+                logger.info(f"VLM loaded: {self.vlm_provider} ({self.vlm_model})")
             except Exception as e:
                 logger.warning(f"VLM initialization failed: {e}")
                 self.use_vlm = False
@@ -509,29 +519,37 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Single document:
+  Single document (positional argument - RECOMMENDED for evaluation):
+    python executable.py invoice.png
+    
+  Single document (with named argument):
     python executable.py --input invoice.pdf --output result.json
     
   Batch processing:
     python executable.py --input_dir ./invoices/ --output_dir ./results/
     
-  With VLM enhancement (OpenAI):
-    python executable.py --input invoice.pdf --use_vlm --vlm_provider openai
+  With local VLM (offline, no internet - DEFAULT):
+    python executable.py invoice.png --use_vlm
     
-  With VLM enhancement (Azure OpenAI):
-    python executable.py --input invoice.pdf --use_vlm --vlm_provider azure \\
-        --azure_endpoint https://your-resource.openai.azure.com \\
-        --azure_deployment gpt-4o-mini
+  With specific VLM model:
+    python executable.py invoice.png --use_vlm --vlm_provider qwen --vlm_model Qwen/Qwen2-VL-7B-Instruct --use_4bit
         """
     )
     
-    parser.add_argument('--input', '-i', type=str, help='Input document path')
+    # Positional argument for input file (for evaluation: python executable.py invoice.png)
+    parser.add_argument('input_file', nargs='?', type=str, help='Input document path (PNG/PDF)')
+    
+    # Named arguments (backward compatibility)
+    parser.add_argument('--input', '-i', type=str, help='Input document path (alternative to positional)')
     parser.add_argument('--input_dir', '-d', type=str, help='Input directory for batch')
     parser.add_argument('--output', '-o', type=str, help='Output JSON path')
     parser.add_argument('--output_dir', type=str, default='./output', help='Output directory')
     parser.add_argument('--use_vlm', action='store_true', help='Use VLM for better accuracy')
-    parser.add_argument('--vlm_provider', type=str, default='openai', choices=['openai', 'azure', 'qwen'],
-                        help='VLM provider: openai, azure, or qwen')
+    parser.add_argument('--vlm_provider', type=str, default='qwen', choices=['qwen', 'openai', 'azure'],
+                        help='VLM provider: qwen (local, default), openai, or azure')
+    parser.add_argument('--vlm_model', type=str, default='Qwen/Qwen2-VL-2B-Instruct',
+                        help='VLM model name (for qwen provider)')
+    parser.add_argument('--use_4bit', action='store_true', help='Use 4-bit quantization (for larger models)')
     
     # Azure OpenAI specific arguments
     parser.add_argument('--azure_endpoint', type=str, help='Azure OpenAI endpoint URL (or set AZURE_OPENAI_ENDPOINT)')
@@ -550,27 +568,30 @@ Examples:
     level = "DEBUG" if args.debug else "INFO"
     logger.add(sys.stderr, level=level, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
     
+    # Resolve input: positional argument takes precedence, then --input
+    input_path = args.input_file or args.input
+    
     # Validate arguments
-    if not args.input and not args.input_dir:
-        parser.error("Either --input or --input_dir is required")
+    if not input_path and not args.input_dir:
+        parser.error("Input required: provide input file as first argument, or use --input or --input_dir")
     
     # Initialize extractor
     extractor = InvoiceExtractor(
         use_vlm=args.use_vlm,
         vlm_provider=args.vlm_provider,
+        vlm_model=getattr(args, 'vlm_model', 'Qwen/Qwen2-VL-2B-Instruct'),
+        use_4bit=getattr(args, 'use_4bit', False),
         yolo_model_path=args.yolo_model,
         use_gpu=not args.no_gpu,
-        azure_endpoint=args.azure_endpoint,
-        azure_deployment=args.azure_deployment,
-        azure_api_key=args.azure_api_key,
-        azure_api_version=args.azure_api_version
+        azure_endpoint=getattr(args, 'azure_endpoint', None),
+        azure_deployment=getattr(args, 'azure_deployment', None),
+        azure_api_key=getattr(args, 'azure_api_key', None),
+        azure_api_version=getattr(args, 'azure_api_version', '2024-02-15-preview')
     )
     
     # Process
-    input_dir_path = Path(args.input_dir) if args.input_dir else None
-    if args.input or (input_dir_path and input_dir_path.is_file()):
-        # Single document
-        input_path = args.input or str(input_dir_path)
+    if input_path:
+        # Single document processing
         result = extractor.extract(input_path)
         
         # Determine output path - use doc_id from result for consistent naming

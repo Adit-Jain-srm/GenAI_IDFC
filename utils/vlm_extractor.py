@@ -1,14 +1,23 @@
 """
 VLM Extractor Module
-Vision Language Model extraction using Qwen2.5-VL or OpenAI API fallback
+Vision Language Model extraction using LOCAL Qwen2-VL (offline, no internet required)
+
+IMPORTANT: This module is designed for OFFLINE deployment where internet is NOT available.
+- Primary: Qwen2-VL-2B/7B (local, fits in 16GB VRAM)
+- Fallback: OpenAI/Azure (only for development/testing with internet)
 
 Prompt Engineering Best Practices Applied:
 - Domain-specific persona (IDFC Bank document processing expert)
 - Chain-of-thought reasoning for complex extractions
 - Few-shot examples for consistent output
 - Multilingual awareness (English, Hindi, Gujarati)
+- VERNACULAR OUTPUT: Hindi/Gujarati names kept as-is (NOT transliterated)
 - Structured output with validation rules
 - Confidence scoring guidelines
+
+GPU Requirements:
+- Qwen2-VL-2B: ~4-5GB VRAM (recommended for speed)
+- Qwen2-VL-7B: ~14-16GB VRAM (with 4-bit quantization)
 """
 
 import os
@@ -25,6 +34,13 @@ from loguru import logger
 QWEN_AVAILABLE = False
 OPENAI_AVAILABLE = False
 AZURE_OPENAI_AVAILABLE = False
+TORCH_AVAILABLE = False
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    pass
 
 try:
     from openai import OpenAI
@@ -66,19 +82,32 @@ ACCURACY STANDARDS:
 
     def __init__(
         self,
-        provider: str = 'openai',
-        model_name: str = 'gpt-4o-mini',
+        provider: str = 'qwen',  # Default to local Qwen (offline, no internet needed)
+        model_name: str = 'Qwen/Qwen2-VL-2B-Instruct',  # 2B fits easily in 16GB VRAM
         api_key: Optional[str] = None,
         azure_endpoint: Optional[str] = None,
         azure_deployment: Optional[str] = None,
         azure_api_version: str = '2024-02-15-preview',
         max_tokens: int = 1500,
-        temperature: float = 0.1
+        temperature: float = 0.1,
+        use_4bit: bool = False,  # Enable 4-bit quantization for larger models
+        device: str = 'auto'  # 'auto', 'cuda', 'cpu'
     ):
+        """
+        Initialize VLM Extractor.
+        
+        Args:
+            provider: 'qwen' (local, recommended), 'openai', or 'azure'
+            model_name: For qwen: 'Qwen/Qwen2-VL-2B-Instruct' or 'Qwen/Qwen2-VL-7B-Instruct'
+            use_4bit: Enable 4-bit quantization (for 7B model on 16GB VRAM)
+            device: 'auto' (recommended), 'cuda', or 'cpu'
+        """
         self.provider = provider
         self.model_name = model_name
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.use_4bit = use_4bit
+        self.device = device
         
         # Azure-specific settings
         self.azure_endpoint = azure_endpoint
@@ -90,12 +119,12 @@ ACCURACY STANDARDS:
         self.client = None
         self._tokens_used = 0
         
-        if provider == 'openai':
+        if provider == 'qwen':
+            self._init_qwen()
+        elif provider == 'openai':
             self._init_openai(api_key)
         elif provider == 'azure':
             self._init_azure(api_key)
-        elif provider == 'qwen':
-            self._init_qwen()
     
     def _init_openai(self, api_key: Optional[str]):
         """Initialize OpenAI client."""
@@ -136,21 +165,89 @@ ACCURACY STANDARDS:
         logger.info(f"Azure OpenAI initialized: endpoint={endpoint}, deployment={deployment}")
     
     def _init_qwen(self):
-        """Initialize Qwen model (lazy load)."""
+        """
+        Initialize Qwen2-VL model for LOCAL inference (no internet needed at runtime).
+        
+        Supports:
+        - Qwen2-VL-2B-Instruct: ~4-5GB VRAM (fast, recommended)
+        - Qwen2-VL-7B-Instruct: ~14-16GB VRAM (with 4-bit quantization)
+        
+        Note: Model weights must be pre-downloaded before deployment.
+        """
         global QWEN_AVAILABLE
+        
+        if not TORCH_AVAILABLE:
+            raise ImportError("PyTorch required for Qwen: pip install torch")
+        
         try:
             import torch
             from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
             QWEN_AVAILABLE = True
             
+            # Check actual CUDA availability (not just requested device)
+            cuda_available = torch.cuda.is_available()
+            
+            # Determine device - force CPU if CUDA not available
+            if self.device == 'cpu' or not cuda_available:
+                device_map = 'cpu'
+                use_fp16 = False  # CPU doesn't support fp16 well
+                if self.device != 'cpu' and not cuda_available:
+                    logger.warning("CUDA not available, falling back to CPU (will be slow)")
+            elif self.device == 'auto':
+                device_map = 'auto'
+                use_fp16 = True
+            else:  # cuda explicitly requested
+                device_map = 'cuda:0'
+                use_fp16 = True
+            
+            # Log GPU memory if available
+            if cuda_available:
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+                logger.info(f"GPU detected: {torch.cuda.get_device_name(0)} ({gpu_mem:.1f}GB)")
+            
+            # Configure model loading
+            model_kwargs = {
+                'torch_dtype': torch.float16 if use_fp16 else torch.float32,
+                'device_map': device_map,
+                'trust_remote_code': True,
+            }
+            
+            # Enable 4-bit quantization for larger models (7B) on limited VRAM
+            # Note: bitsandbytes requires CUDA
+            if self.use_4bit and cuda_available:
+                try:
+                    from transformers import BitsAndBytesConfig
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_use_double_quant=True,
+                        bnb_4bit_quant_type="nf4"
+                    )
+                    model_kwargs['quantization_config'] = quantization_config
+                    logger.info("4-bit quantization enabled for memory efficiency")
+                except ImportError:
+                    logger.warning("bitsandbytes not available, using float16 instead")
+            elif self.use_4bit and not cuda_available:
+                logger.warning("4-bit quantization requires CUDA, using float32 on CPU")
+            
+            logger.info(f"Loading Qwen model: {self.model_name} (device: {device_map})")
             self.model = Qwen2VLForConditionalGeneration.from_pretrained(
                 self.model_name,
-                torch_dtype=torch.float16,
-                device_map='auto'
+                **model_kwargs
             )
-            self.processor = AutoProcessor.from_pretrained(self.model_name)
+            self.processor = AutoProcessor.from_pretrained(
+                self.model_name,
+                trust_remote_code=True
+            )
+            
+            # Store device info for inference
+            self._use_cuda = cuda_available and device_map != 'cpu'
+            
+            logger.info(f"Qwen VLM initialized: {self.model_name} (device: {device_map}, dtype: {'fp16' if use_fp16 else 'fp32'})")
+            
         except Exception as e:
-            logger.warning(f"Qwen init failed: {e}. Use OpenAI fallback.")
+            logger.error(f"Qwen initialization failed: {e}")
+            logger.error("Ensure model is pre-downloaded: python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-VL-2B-Instruct')]\"")
             raise
     
     def extract_fields(self, image: Union[Image.Image, np.ndarray, str, Path]) -> Dict:
@@ -247,17 +344,17 @@ Example 1 - Clear English Invoice (Letterhead Style):
 Input: Document shows "Sharma Tractors Pvt Ltd" header at top, "Mahindra 575 DI" in description, "50 HP" in specs, "Total: ₹5,25,000/-"
 Output: {"dealer_name": "Sharma Tractors Pvt Ltd", "model_name": "Mahindra 575 DI", "horse_power": 50, "asset_cost": 525000, "confidence": 0.95}
 
-Example 2 - Hindi Document:
+Example 2 - Hindi Document (KEEP VERNACULAR - do NOT transliterate):
 Input: Document shows "गुप्ता ट्रैक्टर्स" header, "जॉन डियर 5050D" model, "50 एचपी", "कुल राशि: ₹6,50,000"
-Output: {"dealer_name": "Gupta Tractors", "model_name": "John Deere 5050D", "horse_power": 50, "asset_cost": 650000, "confidence": 0.90}
+Output: {"dealer_name": "गुप्ता ट्रैक्टर्स", "model_name": "John Deere 5050D", "horse_power": 50, "asset_cost": 650000, "confidence": 0.90, "extraction_notes": "Dealer name kept in Hindi as per original"}
 
 Example 3 - Table Format Invoice:
 Input: Document has a table with columns [Item, Description, Specs, Price]. Row 1: "Swaraj 744 XT | 48 HP Tractor | 48 HP | Rs.6,15,000". Footer shows "Grand Total: Rs.6,50,000/-"
 Output: {"dealer_name": null, "model_name": "Swaraj 744 XT", "horse_power": 48, "asset_cost": 650000, "confidence": 0.85, "extraction_notes": "Dealer name not found in visible area"}
 
-Example 4 - Gujarati Document (Mixed Script):
+Example 4 - Gujarati Document (KEEP VERNACULAR - do NOT transliterate):
 Input: Document shows "પટેલ ટ્રેક્ટર્સ" at top, model "Sonalika DI 50" in body, "50 એચપી", total "કુલ: ₹4,75,000"
-Output: {"dealer_name": "Patel Tractors", "model_name": "Sonalika DI 50", "horse_power": 50, "asset_cost": 475000, "confidence": 0.88}
+Output: {"dealer_name": "પટેલ ટ્રેક્ટર્સ", "model_name": "Sonalika DI 50", "horse_power": 50, "asset_cost": 475000, "confidence": 0.88, "extraction_notes": "Dealer name kept in Gujarati as per original"}
 
 Example 5 - Partial Information (Low Quality):
 Input: Scanned document with dealer name and model clearly visible, but HP section is blurry and multiple price values shown without clear total
@@ -291,10 +388,11 @@ Return ONLY a valid JSON object with this exact structure:
 
 ===== CRITICAL RULES =====
 1. DO NOT hallucinate or guess - use null for uncertain fields
-2. Transliterate Hindi/Gujarati names to English (e.g., "गुप्ता" → "Gupta")
+2. **KEEP VERNACULAR**: Output Hindi/Gujarati names EXACTLY as written (e.g., "गुप्ता ट्रैक्टर्स" stays as "गुप्ता ट्रैक्टर्स", NOT "Gupta Tractors")
 3. Always normalize cost to plain integer (5,25,000 → 525000)
 4. Include full model name with variant (e.g., "Mahindra 575 DI XP Plus" not just "575")
 5. Return ONLY the JSON - no explanations before or after
+6. Model names in English are acceptable (brands like Mahindra, Swaraj are international)
 
 Now analyze the provided document image and extract the fields:"""
 
@@ -375,14 +473,17 @@ Now analyze the provided document image and extract the fields:"""
         ]
         
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=[text], images=[pil_image], padding=True, return_tensors="pt").to('cuda')
+        
+        # Determine device for inputs
+        device = 'cuda' if getattr(self, '_use_cuda', False) else 'cpu'
+        inputs = self.processor(text=[text], images=[pil_image], padding=True, return_tensors="pt").to(device)
         
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_tokens,
-                temperature=self.temperature,
-                do_sample=False  # Greedy decoding for consistency
+                temperature=self.temperature if self.temperature > 0 else None,
+                do_sample=self.temperature > 0  # Greedy decoding when temp=0
             )
         
         output = self.processor.batch_decode(output_ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
