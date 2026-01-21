@@ -647,8 +647,12 @@ pip install -r requirements.txt
 
 ### Command-Line Usage
 
-**Single Document**
+**Single Document (Evaluation Format - RECOMMENDED)**
 ```bash
+# Positional argument (for hackathon evaluation)
+python executable.py invoice.png
+
+# Or with named argument
 python executable.py --input invoice.pdf --output result.json
 ```
 
@@ -657,46 +661,46 @@ python executable.py --input invoice.pdf --output result.json
 python executable.py --input_dir ./invoices/ --output_dir ./results/
 ```
 
-**With VLM Enhancement (OpenAI)**
+**With Local VLM (Offline - No Internet Required)**
 ```bash
-export OPENAI_API_KEY=your_api_key
-python executable.py --input invoice.pdf --use_vlm --vlm_provider openai
+# Using default Qwen2-VL-2B model (~5GB VRAM)
+python executable.py invoice.png --use_vlm
+
+# Using larger 7B model with 4-bit quantization (~16GB VRAM)
+python executable.py invoice.png --use_vlm --vlm_model Qwen/Qwen2-VL-7B-Instruct --use_4bit
 ```
 
-**With VLM Enhancement (Azure OpenAI)**
+**With Cloud VLM (Development/Testing Only)**
 ```bash
-# Set environment variables
+# OpenAI
+export OPENAI_API_KEY=your_api_key
+python executable.py --input invoice.pdf --use_vlm --vlm_provider openai
+
+# Azure OpenAI
 export AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
 export AZURE_OPENAI_API_KEY=your_azure_key
 export AZURE_OPENAI_DEPLOYMENT=gpt-4o
-
-# Run extraction
 python executable.py --input invoice.pdf --use_vlm --vlm_provider azure
-```
-
-**Or use CLI arguments for Azure:**
-```bash
-python executable.py --input invoice.pdf --use_vlm --vlm_provider azure \
-    --azure_endpoint https://your-resource.openai.azure.com \
-    --azure_deployment gpt-4o \
-    --azure_api_key your_key
 ```
 
 ### CLI Options
 
 | Option | Description | Default |
 |:-------|:------------|:--------|
-| `--input`, `-i` | Input document path | — |
+| `input_file` | Positional: Input document path (PNG/PDF) | — |
+| `--input`, `-i` | Input document path (alternative to positional) | — |
 | `--input_dir`, `-d` | Input directory for batch processing | — |
 | `--output`, `-o` | Output JSON path | `./sample_output/<doc_id>_result.json` |
 | `--output_dir` | Output directory for batch results | `./output` |
 | `--use_vlm` | Enable VLM for enhanced extraction | `False` |
-| `--vlm_provider` | VLM provider (`openai`, `azure`, or `qwen`) | `openai` |
+| `--vlm_provider` | VLM provider: `qwen` (local), `openai`, or `azure` | `qwen` |
+| `--vlm_model` | Qwen model name | `Qwen/Qwen2-VL-2B-Instruct` |
+| `--use_4bit` | Enable 4-bit quantization (for 7B model) | `False` |
 | `--yolo_model` | Path to custom YOLO model | — |
 | `--no_gpu` | Disable GPU acceleration | `False` |
 | `--debug` | Enable debug logging | `False` |
 
-#### Azure OpenAI Options
+#### Azure OpenAI Options (Development Only)
 
 | Option | Environment Variable | Description |
 |:-------|:---------------------|:------------|
