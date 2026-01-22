@@ -12,12 +12,25 @@ Key Features:
 Optimized for diverse invoice layouts and unknown formats.
 """
 
+import os
 import re
+import warnings
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 import numpy as np
 from PIL import Image
 from loguru import logger
+
+# ============================================================
+# OFFLINE DEPLOYMENT: Hardcoded settings (no .env required)
+# ============================================================
+
+# Suppress harmless pin_memory warning from PyTorch DataLoader
+warnings.filterwarnings('ignore', message=".*pin_memory.*")
+
+# Disable EasyOCR model source connectivity check for offline deployment
+os.environ['EASYOCR_MODULE_PATH'] = os.environ.get('EASYOCR_MODULE_PATH', os.path.expanduser('~/.EasyOCR'))
+os.environ['DISABLE_MODEL_SOURCE_CHECK'] = 'True'
 
 # Primary OCR: EasyOCR (stable, accurate, multilingual)
 try:
@@ -85,8 +98,7 @@ class OCREngine:
         if EASYOCR_AVAILABLE:
             languages = ['en']
             if enable_multilingual:
-                languages.extend(['hi'])  # Hindi uses Devanagari
-                # Note: Gujarati ('gu') requires separate model download
+                languages.extend(['hi'])  # Hindi (Devanagari) - Gujarati not supported by EasyOCR yet
             
             logger.info(f"Loading EasyOCR with languages: {languages}")
             try:

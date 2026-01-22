@@ -1,51 +1,31 @@
-# Document AI - Invoice Field Extraction
-# Convolve 4.0 - Pan-IIT AI/ML Hackathon @ IIT Guwahati
-#
-# IMPORTANT: This solution is designed for OFFLINE deployment (no internet)
-# All models must be pre-downloaded before deployment.
+# IDFC Tractor Loan Document Extraction
+# Convolve 4.0 Hackathon
 
-# Core Dependencies
+# Core
 numpy>=1.24.0
 Pillow>=10.0.0
 loguru>=0.7.0
 python-dotenv>=1.0.0
 
-# PDF Processing
+# PDF/Image Processing
 pdf2image>=1.16.3
 PyMuPDF>=1.23.0
-
-# OCR (EasyOCR primary - multilingual: English, Hindi, Gujarati)
-easyocr>=1.7.0
-
-# Object Detection (Signature/Stamp)
-ultralytics>=8.1.0
 opencv-python>=4.8.0
+
+# OCR (English + Hindi)
+easyocr>=1.7.0
 
 # Text Matching
 rapidfuzz>=3.5.0
 
-# ============================================================
-# VLM - LOCAL INFERENCE (Primary - No Internet Required)
-# ============================================================
-# Qwen2-VL for local vision-language model
-# Models: Qwen/Qwen2-VL-2B-Instruct (~5GB VRAM)
-#         Qwen/Qwen2-VL-7B-Instruct (~16GB VRAM with 4-bit)
-#
-# Pre-download model before deployment (requires HF authentication):
-#   python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-VL-2B-Instruct', token='YOUR_HF_TOKEN')"
-#
+# VLM (Qwen2-VL, IBM Granite Vision)
 torch>=2.0.0
 transformers>=4.40.0,<5.0.0
 accelerate>=0.25.0
-huggingface_hub>=0.34.0,<1.0  # Required version constraint for transformers
+huggingface_hub>=0.34.0,<1.0
 
-# 4-bit quantization support (for 7B model on 16GB VRAM)
-# bitsandbytes>=0.41.0  # Optional: CUDA required, uncomment if using 7B model
-
-# ============================================================
-# VLM - CLOUD APIs (Development/Testing Only - Requires Internet)
-# ============================================================
-# openai>=1.0.0  # Only for development with OpenAI/Azure APIs
-
-# Data Processing
+# EDA/Analysis
 pandas>=2.0.0
+seaborn>=0.12.0
+scipy>=1.10.0
+matplotlib>=3.7.0
