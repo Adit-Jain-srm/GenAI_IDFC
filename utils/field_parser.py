@@ -31,28 +31,56 @@ class FieldParser:
     """
     
     # ============ HORSE POWER PATTERNS ============
+    # Enhanced patterns to handle:
+    # - Hindi numerals (०-९) and HP indicators (एचपी, HP)
+    # - Handwritten text with dots/dashes as separators
+    # - HP embedded in model descriptions
+    # - Parenthesized HP like "(HP- ३९)" or "(39 HP)"
     HP_PATTERNS = [
-        # English patterns - standard
-        r'(\d{2,3})\s*(?:HP|hp|H\.P\.|Hp)',
-        r'(\d{2,3})\s*(?:BHP|bhp|B\.H\.P\.)',
-        r'(?:Horse\s*Power|HP|Power)[:\s]*(\d{2,3})',
-        r'(?:Engine|Motor)[:\s]*(\d{2,3})\s*(?:HP|hp)',
-        # Handwritten patterns - dots/spaces between number and HP
-        r'(\d{2,3})\s*[\.]{2,}\s*(?:HP|hp|H\.P\.|Hp)',  # 25..... H.P.
-        r'(\d{2,3})\s*[\.\-_]+\s*(?:HP|hp|H\.P\.)',     # 25... H.P.
-        r'TRACTOR\s*[\.]+\s*(\d{2,3})\s*[\.]*\s*H\.?P\.?',  # TRACTOR ...25... H.P.
-        # Pattern with model name context
-        r'(?:FE|XT|DI)\s*(?:TRACTOR)?\s*[\.]*\s*(\d{2,3})\s*[\.]*\s*H\.?P\.?',
-        # Hindi patterns
-        r'(\d{2,3})\s*(?:अश्वशक्ति|एचपी|हॉर्स\s*पावर)',
-        r'(?:अश्वशक्ति|पावर)[:\s]*(\d{2,3})',
-        # Gujarati patterns  
-        r'(\d{2,3})\s*(?:અશ્વશક્તિ|એચપી)',
-        # Generic: number near HP keyword
-        r'HP[:\s\-]*(\d{2,3})',
-        r'(\d{2,3})[:\s\-]*HP',
-        # Looser pattern - any 2-digit number followed by H.P. within 20 chars
-        r'(\d{2})\s*.{0,10}H\.?P\.?',
+        # === PRIORITY 1: HP in parentheses (very common in OCR) ===
+        r'\(?HP[\-:\s]*([\d०-९]{2,3})\)?',           # (HP- 39) or (HP: 39)
+        r'\(?([\d०-९]{2,3})\s*HP\)?',                 # (39 HP) or 39 HP
+        r'\(?[\-:\s]*([\d०-९]{2,3})\s*HP\)?',         # (- 39 HP)
+        
+        # === HIGH CONFIDENCE: Explicit HP labels ===
+        r'([\d०-९]{2,3})\s*(?:HP|hp|H\.P\.|Hp)\b',
+        r'([\d०-९]{2,3})\s*(?:BHP|bhp|B\.H\.P\.)\b',
+        r'(?:Horse\s*Power|HP|Power)[:\s]*([\d०-९]{2,3})\b',
+        r'(?:Engine|Motor)[:\s]*([\d०-९]{2,3})\s*(?:HP|hp)',
+        
+        # === Model-embedded HP patterns (common in tractor names) ===
+        # "Swaraj 744 FE 48 HP", "Mahindra 575 DI 45 HP"
+        r'(?:Swaraj|Mahindra|TAFE|Sonalika|John\s*Deere|Eicher|Escorts)[\s\-]*[\d०-९]{3,4}\s*\w*\s+([\d०-९]{2,3})\s*(?:HP|H\.?P\.?)',
+        r'(?:FE|XT|DI|Plus)\s+([\d०-९]{2,3})\s*(?:HP|H\.?P\.?)',
+        
+        # === Handwritten patterns (dots/spaces as separators) ===
+        r'([\d०-९]{2,3})\s*[\.]{2,}\s*(?:HP|hp|H\.P\.|Hp)',  # 25..... H.P.
+        r'([\d०-९]{2,3})\s*[\.\-_]+\s*(?:HP|hp|H\.P\.)',     # 25... H.P.
+        r'TRACTOR\s*[\.]+\s*([\d०-९]{2,3})\s*[\.]*\s*H\.?P\.?',  # TRACTOR ...25... H.P.
+        
+        # === Table patterns (HP in row with model) ===
+        r'(?:PT|Powertrac|Farmtrac)[\s\-]*\w+[\s\-]*(?:HR|DS|Plus)\s+([\d०-९]{2,3})\s*(?:HP)?',
+        
+        # === Hindi patterns ===
+        r'([\d०-९]{2,3})\s*(?:अश्वशक्ति|एचपी|हॉर्स\s*पावर)',
+        r'(?:अश्वशक्ति|पावर|शक्ति)[:\s]*([\d०-९]{2,3})',
+        r'एच\.?पी\.?[:\s]*([\d०-९]{2,3})',
+        r'(?:HP|H\.P\.)[\-\s]*([\d०-९]{2,3})',  # HP-३९ format
+        
+        # === Gujarati patterns ===
+        r'([\d०-९]{2,3})\s*(?:અશ્વશક્તિ|એચપી)',
+        r'(?:અશ્વશક્તિ|પાવર)[:\s]*([\d०-९]{2,3})',
+        
+        # === Generic: number near HP keyword ===
+        r'\bHP[:\s\-]*([\d०-९]{2,3})\b',
+        r'\b([\d०-९]{2,3})[:\s\-]*HP\b',
+        
+        # === Specification table patterns ===
+        r'(?:Rated\s*)?(?:Power|HP)[:\s]+([\d०-९]{2,3})',
+        r'(?:Engine\s*)?(?:Power|Capacity)[:\s]+([\d०-९]{2,3})\s*(?:HP)?',
+        
+        # === Looser pattern (lower priority - only if nothing else matches) ===
+        r'([\d०-९]{2})\s*.{0,10}H\.?P\.?',
     ]
     
     # ============ ASSET COST PATTERNS ============
@@ -122,56 +150,108 @@ class FieldParser:
     ]
     
     # ============ MODEL NAME PATTERNS ============
+    # Enhanced patterns to handle:
+    # - Hindi numerals (०-९)
+    # - OCR misreads (SWARA→Swaraj, SWRAJ→Swaraj)
+    # - Mixed Hindi-English text
+    # - Combined brands (Escorts Kubota)
+    # - Model in description phrases
     MODEL_PATTERNS = [
-        # Solis (Yanmar subsidiary) - also handle OCR errors like Solus, S0lis
-        r'(S[o0][l1][iIu][s5]\s+\d{3,4}\s*(?:2WD|4WD|DI|XT)?(?:\s+\d{2,3}\s*HP)?)',
-        r'(SOLIS\s+\d{3,4}\s*(?:2WD|4WD|DI|XT)?)',
-        r'(Solus\s+\d{3,4}\s*(?:2WD|4WD)?)',  # Common OCR misread
-        # Mahindra variants
-        r'(Mahindra\s+\d{3,4}\s*(?:DI|XP|XT|Plus|Power)?(?:\s*Plus)?)',
-        r'(MAHINDRA\s+\d{3,4}\s*(?:DI|XP|XT|Plus|Power)?)',
-        r'(Arjun\s+(?:Novo\s+)?\d{3,4})',
+        # === PRIORITY 1: Full brand + series + model patterns ===
+        # Mahindra Yuvo Tech (with Hindi numerals and HP in parens)
+        r'(MAHINDRA\s+Y[uU][vV][oO]\s*(?:TECH|Tech)?\s*\+?\s*[\d०-९]{3,4}\s*(?:DI|Dl|XP|XT)?)',
+        r'(Mahindra\s+Yuvo\s*(?:Tech)?\s*\+?\s*[\d०-९]{3,4}\s*(?:DI|XP|XT)?)',
+        
+        # SWARA/SWRAJ → Swaraj (most common OCR error in dataset)
+        r'(?:Cost\s+of|Price\s+of)?\s*(SWARA[JI]?\s*[\d०-९]{3,4}\s*(?:FE|XT|DI)?)',
+        r'(SW[AR]{2,3}J?\s*[\d०-९]{3,4}\s*(?:FE|XT|DI)?)',
+        
+        # === PRIORITY 2: Standard brand + model patterns ===
+        # Swaraj
+        r'(Swaraj\s+[\d०-९]{3,4}\s*(?:FE|XT|DI)?(?:\s*TRACTOR)?)',
+        r'(SWARAJ\s+[\d०-९]{3,4}\s*(?:FE|XT|DI)?)',
+        
+        # Mahindra variants (other series)
+        r'(Mahindra\s+[\d०-९]{3,4}\s*(?:DI|XP|XT|Plus|Power)?(?:\s*Plus)?)',
+        r'(MAHINDRA\s+[\d०-९]{3,4}\s*(?:DI|XP|XT|Plus|Power)?)',
+        r'(Arjun\s+(?:Novo\s+)?[\d०-९]{3,4})',
+        r'(Yuvo\s*(?:Tech)?\s*\+?\s*[\d०-९]{3,4}\s*(?:DI|Dl)?)',  # Mahindra Yuvo series
+        
         # John Deere
-        r'(John\s*Deere\s+\d{4}[A-Z]?)',
-        r'(JD[\s\-]*\d{4}[A-Z]?)',
+        r'(John\s*Deere\s+[\d०-९]{4}[A-Z]?)',
+        r'(JD[\s\-]*[\d०-९]{4}[A-Z]?)',
+        r'(?:Model\s+[Nn]ame[:\s]*)?(John\s*Deere\s+[\d०-९]{4}\s*(?:Gear\s*Pro)?)',
+        
+        # Escorts Kubota (combined brand)
+        r'(Escorts\s*Kubota\s+[\d०-९]{2,4})',
+        r'(Escorts\s*Kubota\s+\w+)',
+        
+        # Sonalika / International Tractors Ltd
+        r'(Sonalika\s+(?:DI\s*)?[\d०-९]+(?:\s*[A-Z]+)?)',
+        r'(Sonalika\s+[A-Z]+\s*[\d०-९]+)',
+        r'(Sonalika\s+GT\s*[\d०-९]+)',
+        
         # TAFE / Massey Ferguson
-        r'(TAFE\s+\d{4})',
-        r'(Massey\s*Ferguson\s+\d{3,4})',
-        r'(MF[\s\-]*\d{3,4})',
-        # Swaraj - various formats and OCR variants
-        r'(Swaraj\s+\d{3,4}\s*(?:FE|XT|DI)?(?:\s*TRACTOR)?)',
-        r'(SWARAJ\s+\d{3,4}\s*(?:FE|XT|DI)?)',
-        r'(Swaraj\s+\d{3}\s*FE)',  # Swaraj 744 FE specific
-        # Sonalika
-        r'(Sonalika\s+(?:DI\s*)?\d+(?:\s*[A-Z]+)?)',
-        r'(Sonalika\s+[A-Z]+\s*\d+)',
+        r'(TAFE\s+[\d०-९]{4})',
+        r'(Massey\s*Ferguson\s+[\d०-९]{3,4})',
+        r'(MF[\s\-]*[\d०-९]{3,4})',
+        
+        # Solis (Yanmar subsidiary) - handle OCR errors
+        r'(S[o0][l1][iIu][s5]\s+[\d०-९]{3,4}\s*(?:2WD|4WD|DI|XT)?)',
+        r'(SOLIS\s+[\d०-९]{3,4}\s*(?:2WD|4WD|DI|XT)?)',
+        
         # New Holland
-        r'(New\s*Holland\s+\d{4})',
-        r'(NH[\s\-]*\d{4})',
+        r'(New\s*Holland\s+[\d०-९]{4})',
+        r'(NH[\s\-]*[\d०-९]{4})',
+        
         # Kubota
-        r'(Kubota\s+\w+[\s\-]?\d+)',
+        r'(Kubota\s+\w+[\s\-]?[\d०-९]+)',
+        
         # Eicher
-        r'(Eicher\s+\d{3,4})',
+        r'(Eicher\s+[\d०-९]{3,4})',
+        
         # Escorts/Farmtrac/Powertrac
-        r'(Farmtrac\s+\d+)',
-        r'(Powertrac\s+\d+)',
-        r'(Escorts\s+\d+)',
+        r'(Farmtrac\s+[\d०-९]+)',
+        r'(Powertrac\s+[\d०-९]+)',
+        r'(Faemtrac\s+[\d०-९]+)',  # Common OCR misread
+        r'(Escorts\s+[\d०-९]+)',
+        
+        # VST / Zetor
+        r'(VST\s+(?:Zetor\s+)?\w*\s*[\d०-९]*)',
+        r'(Zetor\s+[\d०-९]+)',
+        
         # Indo Farm
-        r'(Indo\s*Farm\s+\d+)',
+        r'(Indo\s*Farm\s+[\d०-९]+)',
+        
         # Captain
-        r'(Captain\s+\d{3,4})',
-        # VST / Mitsubishi
-        r'(VST\s+\w+\s*\d+)',
+        r'(Captain\s+[\d०-९]{3,4})',
+        
         # Force Motors
-        r'(Force\s+(?:Orchard|Sanman|Abhiman)\s*\d*)',
-        # Generic patterns
-        r'(?:Model|Tractor)[:\s]+([A-Za-z]+[\s\-]*\d{3,4}[A-Za-z]*)',
+        r'(Force\s+(?:Orchard|Sanman|Abhiman)\s*[\d०-९]*)',
+        
+        # Preet
+        r'(Preet\s+[\d०-९]{3,4})',
+        
+        # HMT
+        r'(HMT\s+[\d०-९]{3,4})',
+        
+        # ACE / Standard
+        r'(ACE\s+[\d०-९]+)',
+        r'(Standard\s+[\d०-९]+)',
+        
+        # === PRIORITY 3: Context-based patterns ===
+        # "Cost of X Tractor" - common quotation format
+        r'(?:Cost\s+of|Price\s+of)\s+([A-Za-z]+[\s\-]*[\d०-९]{3,4}[\s\-]*(?:FE|XT|DI|HP)?)\s*(?:Tractor)?',
+        # Model line with HP embedded
+        r'([A-Za-z]+\s+[\d०-९]{3,4}\s*(?:FE|XT|DI)?)\s*(?:Tractor)?\s*[\.\-]+\s*[\d०-९]{2,3}\s*[\.\-]*\s*H\.?P\.?',
+        # Generic "Model: X" pattern
+        r'(?:Model|Tractor)[:\s]+([A-Za-z]+[\s\-]*[\d०-९]{3,4}[A-Za-z]*)',
     ]
     
     # ============ DEALER PATTERNS ============
     DEALER_PATTERNS = [
-        # Explicit labels
-        r'(?:Dealer|Seller|From|Sold\s*by|Authorized)[:\s]+([^\n\r]+)',
+        # Explicit labels - Note: "From" removed as too generic (matches "from farmer" etc.)
+        r'(?:Dealer|Seller|Sold\s*by|Authorized\s*Dealer)[:\s]+([^\n\r]+)',
         r'(?:विक्रेता|डीलर|एजेंसी)[:\s]+([^\n\r]+)',
         r'(?:વિક્રેતા|ડીલર)[:\s]+([^\n\r]+)',
     ]
@@ -201,7 +281,7 @@ class FieldParser:
             'मॉडल', 'ट्रैक्टर', 'વાહન', 'મોડલ', 'ટ્રેક્ટર'
         ],
         'dealer_name': [
-            'dealer', 'seller', 'from', 'sold by', 'authorized', 'agent',
+            'dealer', 'seller', 'sold by', 'authorized dealer', 'agent',
             'डीलर', 'विक्रेता', 'एजेंट', 'ડીલર', 'વિક્રેતા'
         ]
     }
@@ -348,7 +428,7 @@ class FieldParser:
     def _is_in_exclusion_zone(
         self,
         box: List[int],
-        exclusion_zones: List[Tuple[int, int, int, int]] = None,
+        exclusion_zones: Optional[List[Tuple[int, int, int, int]]] = None,
         iou_threshold: float = 0.1
     ) -> bool:
         """
@@ -382,7 +462,7 @@ class FieldParser:
         self,
         texts: List[str],
         boxes: List[List[int]],
-        exclusion_zones: List[Tuple[int, int, int, int]] = None
+        exclusion_zones: Optional[List[Tuple[int, int, int, int]]] = None
     ) -> Tuple[List[str], List[List[int]]]:
         """
         Filter out text elements that fall within exclusion zones.
@@ -505,7 +585,7 @@ class FieldParser:
     def _extract_with_fallback(
         self,
         field: str,
-        strategies: List[callable]
+        strategies: List
     ) -> Tuple[Any, float]:
         """Try multiple extraction strategies, return best result."""
         best_result = (None, 0.0)
@@ -651,10 +731,109 @@ class FieldParser:
             cost = self._parse_indian_number(raw_value)
             if cost and 50000 <= cost <= 5000000:
                 return (cost, conf)
+        elif field == 'dealer_name':
+            # Validate dealer name - must be reasonable business name
+            cleaned = raw_value.strip()
+            # Reject single words or very short names (likely noise)
+            if len(cleaned) < 5 or ' ' not in cleaned:
+                return (None, 0.0)
+            # Reject common noise words/generic phrases
+            noise_phrases = {
+                'sales service', 'sales & service', 'sales services',
+                'spare parts', 'spares parts', 'service & spare',
+                'authorized dealer', 'authorized dealer for'
+            }
+            if cleaned.lower().strip() in noise_phrases:
+                return (None, 0.0)
+            # Reject if starts with generic label words
+            if re.match(r'^(?:for|to|from|authorized)\s+', cleaned, re.IGNORECASE):
+                # Check if meaningful business name follows
+                stripped = re.sub(r'^(?:for|to|from|authorized\s+dealer\s+for?)\s*', '', cleaned, flags=re.IGNORECASE)
+                if len(stripped.strip()) < 5:
+                    return (None, 0.0)
+                cleaned = stripped.strip()  # Use the stripped version
+            # Reject patterns that are clearly service descriptions, not names
+            service_patterns = [
+                r'^Sales\s+Service',
+                r'^Service\s+&?\s*Spare',
+                r'^Spare\s+Parts',
+                r'^(?:Near|Opp|Behind|Adjacent)\s+',  # Address context
+            ]
+            for pattern in service_patterns:
+                if re.match(pattern, cleaned, re.IGNORECASE):
+                    return (None, 0.0)
+            return (cleaned, conf)
+        elif field == 'model_name':
+            cleaned = raw_value.strip()
+            # Reject single characters or very short names
+            if len(cleaned) < 3:
+                return (None, 0.0)
+            # Reject values that look like prices (Rs, ₹, numbers with commas)
+            if re.match(r'^[Rr][sS][\.\-\s]*[\d,]+', cleaned):
+                return (None, 0.0)
+            if re.match(r'^₹[\d,]+', cleaned):
+                return (None, 0.0)
+            if re.match(r'^[\d,]+\s*[/\-]', cleaned):  # "9,11,769.00 /-" style
+                return (None, 0.0)
+            # Reject if it's purely numeric (with commas)
+            if re.match(r'^[\d,\.]+$', cleaned.replace(' ', '')):
+                return (None, 0.0)
+            # Reject phone numbers and contact info
+            if re.search(r'\b\d{10}\b', cleaned):  # 10-digit phone
+                return (None, 0.0)
+            if re.match(r'^(?:Cell|Phone|Mobile|Tel|Contact)[:\s]', cleaned, re.IGNORECASE):
+                return (None, 0.0)
+            # Reject patterns that are clearly not model names
+            noise_patterns = [
+                r'^Customer\s*[$#@]',  # "Customer $" type
+                r'^(?:Mr|Mrs|Ms|Shri|Smt)[\s\.]',  # Person names
+                r'^(?:Date|Dated?)[:\s]',  # Date fields
+                r'^(?:Invoice|Bill|Quotation)[\s#]',  # Doc references
+                r'@.*\.com',  # Email
+                r'^\d+[\-/]\d+',  # Date or ref numbers
+                r'^[A-Z]{2,5}\d{10,}',  # GST/PAN type
+                r'^(?:Near|Opp|Behind|Adjacent)\s+',  # Address context
+                r'Bus\s*Stand',  # Address landmark
+                r'Pin[\s\-:]*\d{5,6}',  # PIN code in text
+                r'[\-,]\s*\d{6}\b',  # PIN code pattern
+            ]
+            for pattern in noise_patterns:
+                if re.match(pattern, cleaned, re.IGNORECASE):
+                    return (None, 0.0)
+            # Reject generic category words (not specific model names)
+            generic_words = {
+                'tractor', 'tractors', 'spare', 'spares', 'parts', 'accessories',
+                'service', 'sales', 'dealer', 'agency', 'centre', 'center',
+                'equipment', 'machinery', 'agricultural', 'farm', 'vehicle',
+                'customer', 'client', 'buyer', 'purchaser', 'neftrta'
+            }
+            if cleaned.lower() in generic_words:
+                return (None, 0.0)
+            # Reject if mostly corrupted Unicode (broken Hindi/Gujarati encoding)
+            # Check for high ratio of replacement characters or unusual Unicode blocks
+            alpha_ratio = sum(1 for c in cleaned if c.isalpha() or c.isspace() or c in '.-&') / max(len(cleaned), 1)
+            if alpha_ratio < 0.5:
+                return (None, 0.0)
+            return (cleaned, conf)
         else:
             return (raw_value.strip(), conf)
         
         return (None, 0.0)
+    
+    def _is_valid_text(self, text: str) -> bool:
+        """Check if text is valid (not corrupted Unicode)."""
+        if not text:
+            return False
+        # Check for common encoding corruption patterns
+        # These appear when UTF-8 is misread as latin-1 or similar
+        corruption_patterns = [
+            r'[\u0080-\u009f]',  # C1 control characters (rarely valid)
+            r'α[ñÑ][^\s]{2,}',  # Common corruption pattern
+        ]
+        for pattern in corruption_patterns:
+            if re.search(pattern, text):
+                return False
+        return True
     
     def _extract_hp_from_text(self, text: str) -> Optional[int]:
         """Extract HP number from text."""
@@ -784,12 +963,17 @@ class FieldParser:
         
         Returns: (value, confidence) or (None, 0.0)
         """
+        # Normalize Hindi numerals first
+        text = self._normalize_hindi_numerals(text)
+        
         # Try each pattern
         for pattern in self._hp_compiled:
             matches = pattern.findall(text)
             for match in matches:
                 try:
-                    hp = int(match)
+                    # Also normalize the match itself
+                    match_normalized = self._normalize_hindi_numerals(str(match))
+                    hp = int(match_normalized)
                     if 15 <= hp <= 150:  # Valid HP range for tractors
                         return (hp, 0.9)
                 except (ValueError, TypeError):
@@ -797,12 +981,14 @@ class FieldParser:
         
         # Fallback: find numbers near HP keywords
         hp_context = re.search(
-            r'(\d{2,3})\s*.{0,15}(?:HP|hp|अश्वशक्ति|અશ્વશક્તિ)|(?:HP|hp|अश्वशक्ति|અશ્વશક્તિ).{0,15}(\d{2,3})',
+            r'([\d०-९]{2,3})\s*.{0,15}(?:HP|hp|H\.P\.|अश्वशक्ति|અશ્વશક્તિ|एचपी)|(?:HP|hp|H\.P\.|अश्वशक्ति|અશ્વશક્તિ|एचपी).{0,15}([\d०-९]{2,3})',
             text, re.IGNORECASE
         )
         if hp_context:
             try:
-                hp = int(hp_context.group(1) or hp_context.group(2))
+                hp_str = hp_context.group(1) or hp_context.group(2)
+                hp_normalized = self._normalize_hindi_numerals(hp_str)
+                hp = int(hp_normalized)
                 if 15 <= hp <= 150:
                     return (hp, 0.7)
             except (ValueError, TypeError):
@@ -810,7 +996,7 @@ class FieldParser:
         
         return (None, 0.0)
     
-    def extract_cost(self, text: str, context_text: str = None) -> Tuple[Optional[int], float]:
+    def extract_cost(self, text: str, context_text: Optional[str] = None) -> Tuple[Optional[int], float]:
         """
         Extract asset cost/price.
         
@@ -946,12 +1132,25 @@ class FieldParser:
         
         return False
     
-    def extract_model(self, text: str, texts: List[str] = None) -> Tuple[Optional[str], float]:
+    def _normalize_hindi_numerals(self, text: str) -> str:
+        """Convert Hindi/Devanagari numerals to Arabic numerals."""
+        hindi_to_arabic = {
+            '०': '0', '१': '1', '२': '2', '३': '3', '४': '4',
+            '५': '5', '६': '6', '७': '7', '८': '8', '९': '9'
+        }
+        for hindi, arabic in hindi_to_arabic.items():
+            text = text.replace(hindi, arabic)
+        return text
+    
+    def extract_model(self, text: str, texts: Optional[List[str]] = None) -> Tuple[Optional[str], float]:
         """
         Extract tractor model name.
         
         Returns: (value, confidence) or (None, 0.0)
         """
+        # Normalize Hindi numerals to Arabic
+        text = self._normalize_hindi_numerals(text)
+        
         # Try brand-specific patterns
         for pattern in self._model_compiled:
             matches = pattern.findall(text)
@@ -964,8 +1163,9 @@ class FieldParser:
         # Try to find model in individual text lines
         if texts:
             for line in texts:
+                line_normalized = self._normalize_hindi_numerals(line)
                 for pattern in self._model_compiled:
-                    matches = pattern.findall(line)
+                    matches = pattern.findall(line_normalized)
                     if matches:
                         model = re.sub(r'\s+', ' ', matches[0]).strip()
                         return (self._normalize_model(model), 0.85)
@@ -977,8 +1177,12 @@ class FieldParser:
         if not model:
             return model
         
-        # Capitalize brand names properly (also fix OCR misreads)
-        model = re.sub(r'\b(?:solis|solus|s0lis)\b', 'Solis', model, flags=re.IGNORECASE)
+        # First normalize Hindi numerals
+        model = self._normalize_hindi_numerals(model)
+        
+        # Fix OCR misreads of brand names
+        model = re.sub(r'\b(?:SWARA|SWRAJ|SWARAI|SWRAR)\b', 'Swaraj', model, flags=re.IGNORECASE)
+        model = re.sub(r'\b(?:solis|solus|s0lis|s[o0]l[iI1]s)\b', 'Solis', model, flags=re.IGNORECASE)
         model = re.sub(r'\bmahindra\b', 'Mahindra', model, flags=re.IGNORECASE)
         model = re.sub(r'\bjohn\s*deere\b', 'John Deere', model, flags=re.IGNORECASE)
         model = re.sub(r'\btafe\b', 'TAFE', model, flags=re.IGNORECASE)
@@ -986,8 +1190,22 @@ class FieldParser:
         model = re.sub(r'\bsonalika\b', 'Sonalika', model, flags=re.IGNORECASE)
         model = re.sub(r'\bmassey\s*ferguson\b', 'Massey Ferguson', model, flags=re.IGNORECASE)
         model = re.sub(r'\bnew\s*holland\b', 'New Holland', model, flags=re.IGNORECASE)
+        model = re.sub(r'\beicher\b', 'Eicher', model, flags=re.IGNORECASE)
+        model = re.sub(r'\b(?:farmtrac|faemtrac)\b', 'Farmtrac', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bpowertrac\b', 'Powertrac', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bkubota\b', 'Kubota', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bescorts\s*kubota\b', 'Escorts Kubota', model, flags=re.IGNORECASE)
+        model = re.sub(r'\byuvo\b', 'Yuvo', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bарjun\b', 'Arjun', model, flags=re.IGNORECASE)
         model = re.sub(r'\b2wd\b', '2WD', model, flags=re.IGNORECASE)
         model = re.sub(r'\b4wd\b', '4WD', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bFE\b', 'FE', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bDI\b', 'DI', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bXT\b', 'XT', model, flags=re.IGNORECASE)
+        model = re.sub(r'\bgear\s*pro\b', 'Gear Pro', model, flags=re.IGNORECASE)
+        
+        # Remove trailing "TRACTOR" word
+        model = re.sub(r'\s*TRACTOR\s*$', '', model, flags=re.IGNORECASE)
         
         return model.strip()
     
@@ -995,16 +1213,17 @@ class FieldParser:
         self,
         text: str,
         texts: List[str],
-        boxes: List[List[int]] = None
+        boxes: Optional[List[List[int]]] = None
     ) -> Tuple[Optional[str], float]:
         """
         Extract dealer/seller name.
         
         Strategy:
         1. Look for labeled dealer name
-        2. Find business names in header region
-        3. Pattern match company names
+        2. Find business names with "Ltd", "Pvt" etc. (header region first, then full doc)
+        3. Pattern match company names with tractor/motor keywords
         4. Look for prominent uppercase names with business keywords
+        5. Fall back to first meaningful line
         
         Returns: (value, confidence) or (None, 0.0)
         """
@@ -1014,20 +1233,30 @@ class FieldParser:
             if match:
                 dealer = match.group(1).strip()
                 dealer = re.sub(r'[:\-\|]+$', '', dealer).strip()
-                if len(dealer) > 3 and not dealer.isdigit():
+                if self._validate_dealer_name(dealer):
                     return (dealer, 0.95)
         
-        # Strategy 2: Check header lines (first 10 lines) for business names
+        # Strategy 2: Check header lines (first 10 lines) for business names  
         for line in texts[:10]:
             line_lower = line.lower()
             
             # Check for business suffixes
             if any(suffix in line_lower for suffix in self.BUSINESS_SUFFIXES):
                 dealer = self._clean_dealer_name(line)
-                if dealer and len(dealer) > 5:
+                if self._validate_dealer_name(dealer):
                     return (dealer, 0.85)
         
-        # Strategy 3: Pattern match company names anywhere (case-insensitive)
+        # Strategy 2b: Search full document for "... Ltd" or "... Pvt Ltd" patterns
+        # These are high-confidence indicators of company names
+        ltd_pattern = r'([A-Z][A-Za-z\s&]+(?:Ltd\.?|Limited|Pvt\.?\s*Ltd\.?|Private\s*Limited))'
+        for match in re.finditer(ltd_pattern, text):
+            candidate = match.group(1).strip()
+            # Filter out generic phrases like "Full Cost of Tractor Ltd" (unlikely)
+            if len(candidate) > 8 and not re.search(r'(cost|price|amount|total|full)', candidate, re.I):
+                if self._validate_dealer_name(candidate):
+                    return (candidate, 0.80)
+        
+        # Strategy 3: Pattern match company names with tractor/motor keywords
         company_patterns = [
             r'([A-Za-z][A-Za-z\s&]+(?:TRACTOR|Tractor|TRACTORS|Tractors|MOTORS|Motors|AUTO|Auto|AGENCIES|Agencies|ENTERPRISES|Enterprises))',
             r'([A-Z][A-Za-z\s&]+(?:Tractors?|Motors?|Auto|Agencies|Enterprises)[A-Za-z\s&]*(?:Pvt\.?|Private)?\.?\s*(?:Ltd\.?|Limited)?)',
@@ -1038,7 +1267,7 @@ class FieldParser:
             match = re.search(pattern, text)
             if match:
                 dealer = self._clean_dealer_name(match.group(1))
-                if dealer and len(dealer) > 5:
+                if self._validate_dealer_name(dealer):
                     return (dealer, 0.75)
         
         # Strategy 4: Look for uppercase words with TRACTOR/MOTOR in text
@@ -1046,14 +1275,21 @@ class FieldParser:
         match = re.search(uppercase_pattern, text)
         if match:
             dealer = match.group(1).strip().title()
-            if len(dealer) > 5:
+            if self._validate_dealer_name(dealer):
                 return (dealer, 0.7)
         
         # Strategy 5: First line often contains dealer name (letterhead)
         if texts and len(texts[0]) > 5:
             first_line = texts[0].strip()
-            if not first_line.isdigit() and not re.match(r'^(Date|Invoice|Quotation|GST|Bill)', first_line, re.I):
-                return (first_line, 0.6)
+            # Skip common document headers
+            skip_patterns = [
+                r'^(Date|Invoice|Quotation|GST|Bill|Tax|Ref)',
+                r'^[\(\[]',  # Lines starting with brackets
+                r'^\d',      # Lines starting with numbers
+            ]
+            if not any(re.match(p, first_line, re.I) for p in skip_patterns):
+                if self._validate_dealer_name(first_line):
+                    return (first_line, 0.6)
         
         return (None, 0.0)
     
@@ -1073,6 +1309,75 @@ class FieldParser:
         name = re.sub(r'\s+', ' ', name).strip()
         
         return name
+    
+    def _validate_dealer_name(self, name: str) -> bool:
+        """
+        Validate if a string is a valid dealer name.
+        Returns True if valid, False otherwise.
+        """
+        if not name or len(name) < 5:
+            return False
+        
+        name_lower = name.lower().strip()
+        
+        # Must have at least one space (multi-word name) OR be a known company suffix
+        if ' ' not in name and not re.search(r'(?:ltd|limited|pvt|tractors?|motors?)$', name_lower):
+            return False
+        
+        # Reject email addresses or email-like patterns
+        if '@' in name or re.search(r'[a-z]+@[a-z]+|gmail|yahoo|email|\.com', name_lower):
+            return False
+        
+        # Reject generic service descriptions
+        noise_phrases = {
+            'sales service', 'sales & service', 'sales services',
+            'spare parts', 'spares parts', 'service & spare',
+            'authorized dealer', 'authorized dealer for',
+            'sales service & spare parts', 'service & spare parts',
+            'spare accesories', 'spare accessories', 'tractors spare',
+            'service spare parts', 'sales & spare parts'
+        }
+        # Check if the name IS just a noise phrase
+        if name_lower.strip() in noise_phrases:
+            return False
+        
+        # Reject if name CONTAINS only generic service words (no actual company name)
+        # Pattern: mostly generic words with maybe tractor brand thrown in
+        generic_words = {'sales', 'service', 'spare', 'parts', 'authorized', 'dealer', 
+                        'for', 'the', 'and', '&', 'accesories', 'accessories', 'autho',
+                        'autho.', 'स्पेयर', 'पार्टस्', 'एवं', 'सेवा'}
+        words = name_lower.split()
+        if len(words) > 0:
+            generic_count = sum(1 for w in words if w.rstrip('.,:') in generic_words)
+            if generic_count / len(words) > 0.7 and len(words) >= 3:
+                return False
+        
+        # Reject if starts with generic label words
+        if re.match(r'^(?:for|to|from|authorized\s+dealer)\s+', name, re.IGNORECASE):
+            stripped = re.sub(r'^(?:for|to|from|authorized\s+dealer\s+for?)\s*', '', name, flags=re.IGNORECASE)
+            if len(stripped.strip()) < 5:
+                return False
+        
+        # Reject patterns that are clearly service descriptions
+        service_patterns = [
+            r'^Sales\s+Service',
+            r'^Service\s+&?\s*Spare',
+            r'^Spare\s+Parts',
+            r'^(?:Near|Opp|Behind|Adjacent)\s+',
+            r'^Descri[pn]tion',  # OCR misread of "Description"
+            r'^Autho\.?\s+Dealer',  # "Autho. Dealer..."
+            r'Spare\s+Acce[s]*ories',  # "Spare Accesories"
+            r'^\s*ट्रेक्टर्स\s+एवं\s+स्पेयर',  # Hindi "Tractors and Spare Parts"
+        ]
+        for pattern in service_patterns:
+            if re.search(pattern, name, re.IGNORECASE):
+                return False
+        
+        # Reject corrupted Unicode (broken Hindi/Gujarati)
+        if re.search(r'α[ñÑ][^\s]{2,}', name):
+            return False
+        
+        return True
     
     def get_text_regions(
         self,

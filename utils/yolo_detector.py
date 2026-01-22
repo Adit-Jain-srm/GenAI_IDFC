@@ -9,14 +9,30 @@ Features:
 - Full document search (not just fixed regions)
 """
 
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Tuple
 import numpy as np
 from PIL import Image
 from loguru import logger
 
+# ============================================================
+# OFFLINE DEPLOYMENT: Hardcoded settings (no .env required)
+# ============================================================
+# Disable pin_memory for DataLoaders (required for some GPU configurations)
+os.environ['PIN_MEMORY'] = 'False'
+
+# Disable Ultralytics telemetry and online checks for offline deployment
+os.environ['YOLO_OFFLINE'] = 'True'
+
 try:
     from ultralytics import YOLO
+    # Configure ultralytics settings for offline deployment
+    try:
+        from ultralytics import settings
+        settings.update({'sync': False})  # Disable online sync
+    except Exception:
+        pass
     YOLO_AVAILABLE = True
 except ImportError:
     YOLO_AVAILABLE = False

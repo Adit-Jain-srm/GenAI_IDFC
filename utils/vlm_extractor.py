@@ -30,6 +30,16 @@ import numpy as np
 from PIL import Image
 from loguru import logger
 
+# ============================================================
+# OFFLINE DEPLOYMENT: Hardcoded settings (no .env required)
+# ============================================================
+# Disable Hugging Face online checks for offline model loading
+os.environ.setdefault('HF_HUB_OFFLINE', '1')
+os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
+
+# Disable pin_memory for DataLoaders
+os.environ.setdefault('PIN_MEMORY', 'False')
+
 # Lazy imports for resource efficiency
 QWEN_AVAILABLE = False
 OPENAI_AVAILABLE = False
@@ -88,8 +98,8 @@ ACCURACY STANDARDS:
         azure_endpoint: Optional[str] = None,
         azure_deployment: Optional[str] = None,
         azure_api_version: str = '2024-02-15-preview',
-        max_tokens: int = 1500,
-        temperature: float = 0.1,
+        max_tokens: int = 256,  # Minimal tokens for speed - ≤30s target
+        temperature: float = 0.0,  # Greedy for consistency
         use_4bit: bool = False,  # Enable 4-bit quantization for larger models
         device: str = 'auto'  # 'auto', 'cuda', 'cpu'
     ):
@@ -118,9 +128,12 @@ ACCURACY STANDARDS:
         self.processor = None
         self.client = None
         self._tokens_used = 0
+        self._use_cuda = False  # Track CUDA usage
         
         if provider == 'qwen':
             self._init_qwen()
+        elif provider == 'granite':
+            self._init_granite()
         elif provider == 'openai':
             self._init_openai(api_key)
         elif provider == 'azure':
@@ -207,7 +220,7 @@ ACCURACY STANDARDS:
             
             # Configure model loading
             model_kwargs = {
-                'torch_dtype': torch.float16 if use_fp16 else torch.float32,
+                'dtype': torch.float16 if use_fp16 else torch.float32,
                 'device_map': device_map,
                 'trust_remote_code': True,
             }
@@ -249,6 +262,72 @@ ACCURACY STANDARDS:
             logger.error(f"Qwen initialization failed: {e}")
             logger.error("Ensure model is pre-downloaded: python -c \"from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen2-VL-2B-Instruct')]\"")
             raise
+
+    def _init_granite(self):
+        """
+        Initialize IBM Granite Vision for LOCAL inference.
+        
+        Supports:
+        - granite-docling-258M: Ultra-fast (258M params), optimized for document conversion
+        - granite-vision-3.2-2b: More accurate (2B params), ranked #2 OCRBench
+        
+        Both are Apache 2.0 licensed, enterprise-friendly.
+        """
+        global TORCH_AVAILABLE
+        
+        if not TORCH_AVAILABLE:
+            raise ImportError("PyTorch required for Granite: pip install torch")
+        
+        try:
+            import torch
+            from transformers import AutoProcessor, AutoModelForImageTextToText
+            
+            cuda_available = torch.cuda.is_available()
+            
+            if not cuda_available:
+                logger.warning("CUDA not available, falling back to CPU")
+                device_map = 'cpu'
+                use_fp16 = False
+            else:
+                device_map = 'auto'
+                use_fp16 = True
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+                logger.info(f"GPU detected: {torch.cuda.get_device_name(0)} ({gpu_mem:.1f}GB)")
+            
+            # Detect model variant
+            model_name = self.model_name if 'granite' in self.model_name.lower() else 'ibm-granite/granite-docling-258M'
+            is_docling = 'docling' in model_name.lower()
+            
+            model_kwargs = {
+                'torch_dtype': torch.float16 if use_fp16 else torch.float32,
+                'device_map': device_map,
+                'trust_remote_code': True,
+            }
+            
+            # Docling model needs revision="untied" for proper loading
+            if is_docling:
+                model_kwargs['revision'] = 'untied'
+            
+            logger.info(f"Loading Granite model: {model_name} (device: {device_map})")
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_name,
+                **model_kwargs
+            )
+            self.processor = AutoProcessor.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                revision='untied' if is_docling else None
+            )
+            
+            self._use_cuda = cuda_available and device_map != 'cpu'
+            self.model_name = model_name
+            
+            logger.info(f"Granite VLM initialized: {model_name} (device: {device_map}, dtype: {'fp16' if use_fp16 else 'fp32'})")
+            
+        except Exception as e:
+            logger.error(f"Granite initialization failed: {e}")
+            logger.error("Install: pip install transformers>=4.49")
+            raise
     
     def extract_fields(self, image: Union[Image.Image, np.ndarray, str, Path]) -> Dict:
         """
@@ -261,140 +340,24 @@ ACCURACY STANDARDS:
         
         if self.provider in ('openai', 'azure'):
             return self._extract_openai(image, prompt)
+        elif self.provider == 'granite':
+            return self._extract_granite(image, prompt)
         else:
             return self._extract_qwen(image, prompt)
     
     def _get_extraction_prompt(self) -> str:
         """
-        Get the optimized extraction prompt with best practices:
-        - Chain-of-thought reasoning
-        - Few-shot examples
-        - Structured output format
-        - Validation guidelines
+        Get compact extraction prompt optimized for speed.
+        Minimal tokens for ≤30s CPU inference.
         """
-        return """TASK: Extract key fields from this tractor dealer quotation/invoice for IDFC Bank loan processing.
+        return """Extract from this tractor quotation:
+1. dealer_name: Company name at top
+2. model_name: Tractor brand+model (Mahindra/Swaraj/John Deere/etc + number)
+3. horse_power: HP value (15-150 range)
+4. asset_cost: Total price in INR
 
-===== VISUAL LAYOUT ANALYSIS =====
-
-First, analyze the document structure:
-
-**DOCUMENT REGIONS:**
-- TOP (0-20%): Usually contains dealer letterhead, logo, company name, contact info
-- MIDDLE (20-75%): Product details, specifications table, pricing breakdown
-- BOTTOM (75-100%): Totals, signatures, stamps, terms & conditions
-
-**COMMON LAYOUTS:**
-1. **Letterhead Style**: Dealer name prominent at top, items listed below
-2. **Table Format**: Rows with Description | Specs | Price columns
-3. **Form Style**: Key: Value pairs aligned vertically
-4. **Mixed**: Combination of above
-
-**KEY-VALUE PAIRS**: Look for patterns like:
-- "Label: Value" (colon-separated)
-- Label on LEFT, value on RIGHT (same row)
-- Label ABOVE, value BELOW (stacked)
-
-===== STEP-BY-STEP EXTRACTION PROCESS =====
-
-1. **DEALER NAME** - Look for:
-   - Company name in letterhead/header (TOP 20% of document)
-   - Text after "From:", "Dealer:", "Authorized Dealer"
-   - Business registration details, GST numbers nearby
-   - Look for logos with company names
-   - Hindi: "डीलर", "विक्रेता" | Gujarati: "ડીલર"
-
-2. **MODEL NAME** - Look for:
-   - Tractor model in product description section (MIDDLE region)
-   - Often in a table row or as a prominent item
-   - Format: [Brand] [Number] [Variant] (e.g., "Mahindra 575 DI XP Plus")
-   - Common brands: Mahindra, John Deere, Swaraj, Sonalika, TAFE, Massey Ferguson, New Holland, Kubota, Eicher, Farmtrac, Powertrac
-   - May be in bold or larger font
-   - Hindi: "मॉडल", "ट्रैक्टर" | Gujarati: "મોડલ", "ટ્રેક્ટર"
-
-3. **HORSE POWER** - Look for:
-   - Often in a specifications table or near model name
-   - Number followed by "HP", "hp", "Horse Power", "BHP", "H.P."
-   - May be in a column labeled "Power" or "Engine"
-   - Valid range: 15-150 HP for tractors
-   - **OFTEN HANDWRITTEN** - Look for handwritten numbers near "H.P." or "HP" text
-   - May appear inline with model: "SWARAJ 744 FE TRACTOR .....25..... H.P."
-   - Common values: 25, 30, 35, 40, 45, 50, 55, 60, 65, 75, 90 HP
-   - Hindi: "अश्वशक्ति", "एचपी" | Gujarati: "એચપી", "અશ્વશક્તિ"
-
-4. **ASSET COST** - Look for:
-   - Final/Total amount (BOTTOM region, often last row of table)
-   - Usually the LARGEST number on the document
-   - Labels: "Total", "Grand Total", "Net Amount", "Ex-Showroom", "On-Road Price"
-   - Indian format: ₹5,25,000 or Rs. 5,25,000/- means 525000
-   - Valid range: ₹50,000 - ₹50,00,000
-   - Often bold or highlighted
-   - Look for handwritten amounts - they are often the final price
-   - Hindi: "कुल", "राशि", "मूल्य" | Gujarati: "કુલ", "કિંમત"
-   
-   ⚠️ **CRITICAL - DO NOT CONFUSE WITH PIN CODES:**
-   - Indian PIN codes are 6-digit numbers (e.g., 306115, 382010)
-   - PIN codes appear in ADDRESS sections near: "Dist.", "District", city names, "Rajasthan", "Gujarat", etc.
-   - Example: "RANI - 306115, Dist.-Pali (Raj.)" → 306115 is a PIN code, NOT a price
-   - Prices have ₹/Rs. prefix and appear near "Total", "Amount", "Price" labels
-   - When in doubt, prefer the larger number with price formatting (commas like 5,50,000)
-
-===== FEW-SHOT EXAMPLES =====
-
-Example 1 - Clear English Invoice (Letterhead Style):
-Input: Document shows "Sharma Tractors Pvt Ltd" header at top, "Mahindra 575 DI" in description, "50 HP" in specs, "Total: ₹5,25,000/-"
-Output: {"dealer_name": "Sharma Tractors Pvt Ltd", "model_name": "Mahindra 575 DI", "horse_power": 50, "asset_cost": 525000, "confidence": 0.95}
-
-Example 2 - Hindi Document (KEEP VERNACULAR - do NOT transliterate):
-Input: Document shows "गुप्ता ट्रैक्टर्स" header, "जॉन डियर 5050D" model, "50 एचपी", "कुल राशि: ₹6,50,000"
-Output: {"dealer_name": "गुप्ता ट्रैक्टर्स", "model_name": "John Deere 5050D", "horse_power": 50, "asset_cost": 650000, "confidence": 0.90, "extraction_notes": "Dealer name kept in Hindi as per original"}
-
-Example 3 - Table Format Invoice:
-Input: Document has a table with columns [Item, Description, Specs, Price]. Row 1: "Swaraj 744 XT | 48 HP Tractor | 48 HP | Rs.6,15,000". Footer shows "Grand Total: Rs.6,50,000/-"
-Output: {"dealer_name": null, "model_name": "Swaraj 744 XT", "horse_power": 48, "asset_cost": 650000, "confidence": 0.85, "extraction_notes": "Dealer name not found in visible area"}
-
-Example 4 - Gujarati Document (KEEP VERNACULAR - do NOT transliterate):
-Input: Document shows "પટેલ ટ્રેક્ટર્સ" at top, model "Sonalika DI 50" in body, "50 એચપી", total "કુલ: ₹4,75,000"
-Output: {"dealer_name": "પટેલ ટ્રેક્ટર્સ", "model_name": "Sonalika DI 50", "horse_power": 50, "asset_cost": 475000, "confidence": 0.88, "extraction_notes": "Dealer name kept in Gujarati as per original"}
-
-Example 5 - Partial Information (Low Quality):
-Input: Scanned document with dealer name and model clearly visible, but HP section is blurry and multiple price values shown without clear total
-Output: {"dealer_name": "ABC Motors", "model_name": "Swaraj 744 FE", "horse_power": null, "asset_cost": null, "confidence": 0.55, "extraction_notes": "HP illegible, cost ambiguous - multiple values without clear total"}
-
-Example 6 - PIN Code vs Price (IMPORTANT):
-Input: Header shows "KISSAN TRACTOR AGENCY, Kenpura Road, RANI - 306115, Dist.-Pali (Raj.)". Body shows "SWARAJ 744 FE TRACTOR ...25... H.P." with handwritten "25". Price section shows "Rs. 5,50,600" and "Total Amount Rs.: 5,50,000/-"
-Output: {"dealer_name": "Kissan Tractor Agency", "model_name": "Swaraj 744 FE", "horse_power": 25, "asset_cost": 550000, "confidence": 0.90, "extraction_notes": "306115 is PIN code in address, not price. Used handwritten total amount."}
-WRONG: {"asset_cost": 306115} ← This is the PIN code from address, NOT the price!
-
-===== OUTPUT FORMAT =====
-
-Return ONLY a valid JSON object with this exact structure:
-```json
-{
-  "dealer_name": "string or null",
-  "model_name": "string or null (include brand + model + variant)",
-  "horse_power": integer or null (15-150 range only),
-  "asset_cost": integer or null (50000-5000000 range, no currency symbols),
-  "confidence": float (0.0-1.0),
-  "extraction_notes": "brief note on any issues or uncertainties"
-}
-```
-
-===== CONFIDENCE SCORING GUIDELINES =====
-- 0.90-1.00: All fields clearly visible and extracted with high certainty
-- 0.75-0.89: Most fields clear, 1-2 minor uncertainties
-- 0.50-0.74: Some fields unclear or potentially incorrect
-- 0.25-0.49: Multiple fields uncertain, low quality document
-- 0.00-0.24: Unable to extract reliably, severe quality issues
-
-===== CRITICAL RULES =====
-1. DO NOT hallucinate or guess - use null for uncertain fields
-2. **KEEP VERNACULAR**: Output Hindi/Gujarati names EXACTLY as written (e.g., "गुप्ता ट्रैक्टर्स" stays as "गुप्ता ट्रैक्टर्स", NOT "Gupta Tractors")
-3. Always normalize cost to plain integer (5,25,000 → 525000)
-4. Include full model name with variant (e.g., "Mahindra 575 DI XP Plus" not just "575")
-5. Return ONLY the JSON - no explanations before or after
-6. Model names in English are acceptable (brands like Mahindra, Swaraj are international)
-
-Now analyze the provided document image and extract the fields:"""
+Return ONLY valid JSON:
+{"dealer_name": "...", "model_name": "...", "horse_power": null, "asset_cost": null, "confidence": 0.8}"""
 
     def _extract_openai(self, image: Union[Image.Image, np.ndarray, str, Path], prompt: str) -> Dict:
         """
@@ -458,6 +421,7 @@ Now analyze the provided document image and extract the fields:"""
         import torch
         
         pil_image = self._to_pil(image)
+        pil_image = self._resize_for_speed(pil_image)  # Resize for faster inference
         
         # Combine system and user prompts for Qwen format
         combined_prompt = f"{self.SYSTEM_PROMPT}\n\n{prompt}"
@@ -491,6 +455,129 @@ Now analyze the provided document image and extract the fields:"""
         
         # Post-process and validate
         return self._validate_extraction(result)
+    
+    def _extract_granite(self, image: Union[Image.Image, np.ndarray, str, Path], prompt: str) -> Dict:
+        """
+        Extract using IBM Granite Vision model.
+        
+        Supports both:
+        - granite-docling-258M: OCR/document conversion (returns markdown)
+        - granite-vision-3.2-2b: Vision QA (returns JSON)
+        """
+        import torch
+        
+        pil_image = self._to_pil(image)
+        pil_image = self._resize_for_speed(pil_image, max_size=768)
+        
+        is_docling = 'docling' in self.model_name.lower()
+        
+        if is_docling:
+            # Docling model: Simple prompt for document OCR, then parse with field parser
+            combined_prompt = "Convert this page to docling."
+        else:
+            # Granite Vision: Full extraction prompt
+            combined_prompt = f"{self.SYSTEM_PROMPT}\n\n{prompt}"
+        
+        # LLaVA-style conversation format
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": combined_prompt}
+                ]
+            }
+        ]
+        
+        text = self.processor.apply_chat_template(conversation, add_generation_prompt=True)
+        
+        device = 'cuda' if self._use_cuda else 'cpu'
+        inputs = self.processor(text=text, images=pil_image, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=2048 if is_docling else self.max_tokens,  # Docling needs more tokens for full doc
+                do_sample=False
+            )
+        
+        output = self.processor.batch_decode(
+            output_ids[:, inputs.input_ids.shape[1]:], 
+            skip_special_tokens=True
+        )[0]
+        
+        if is_docling:
+            # Docling returns markdown/doctags - extract fields from text
+            result = self._parse_docling_output(output)
+        else:
+            result = self._parse_json(output)
+        
+        return self._validate_extraction(result)
+    
+    def _parse_docling_output(self, text: str) -> Dict:
+        """
+        Parse Docling markdown/doctags output to extract structured fields.
+        
+        Docling returns document structure in markdown format. We extract
+        key fields using pattern matching on the OCR'd text.
+        """
+        import re
+        
+        result = {
+            "dealer_name": None,
+            "model_name": None,
+            "horse_power": None,
+            "asset_cost": None,
+            "confidence": 0.7  # Docling OCR is reliable
+        }
+        
+        text_lower = text.lower()
+        
+        # Extract dealer name - look for company/dealer patterns
+        dealer_patterns = [
+            r'(?:from|dealer|authorized|authorised)[:\s]*([A-Z][A-Za-z\s&]+(?:Ltd|Pvt|Private|Limited|Tractors?|Motors?|Agency|Enterprise))',
+            r'^([A-Z][A-Za-z\s&]+(?:Tractors?|Motors?|Agency|Automotive|Automobiles))',
+        ]
+        for pattern in dealer_patterns:
+            match = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+            if match:
+                result["dealer_name"] = match.group(1).strip()
+                break
+        
+        # Extract model name - tractor brands
+        brands = r'(?:Mahindra|John\s*Deere|Swaraj|Sonalika|TAFE|Massey|New\s*Holland|Kubota|Eicher|Farmtrac|Powertrac|Escorts)'
+        model_match = re.search(rf'({brands}[\s\-]*\d+[\w\s\-]*)', text, re.IGNORECASE)
+        if model_match:
+            result["model_name"] = model_match.group(1).strip()
+        
+        # Extract HP - look for HP/BHP values
+        hp_match = re.search(r'(\d{2,3})\s*(?:HP|H\.?P\.?|BHP|Horse\s*Power)', text, re.IGNORECASE)
+        if hp_match:
+            hp_val = int(hp_match.group(1))
+            if 15 <= hp_val <= 150:
+                result["horse_power"] = hp_val
+        
+        # Extract cost - largest number with currency formatting
+        cost_patterns = [
+            r'(?:total|grand\s*total|amount|price|cost)[:\s]*₹?\s*([\d,]+)',
+            r'₹\s*([\d,]+)',
+            r'Rs\.?\s*([\d,]+)',
+        ]
+        costs = []
+        for pattern in cost_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                try:
+                    cost_str = match.group(1).replace(',', '')
+                    cost_val = int(cost_str)
+                    if 50000 <= cost_val <= 5000000:  # Valid tractor range
+                        costs.append(cost_val)
+                except:
+                    pass
+        
+        if costs:
+            result["asset_cost"] = max(costs)  # Usually the largest is the total
+        
+        return result
     
     def _parse_json(self, text: str) -> Dict:
         """
@@ -624,6 +711,15 @@ Now analyze the provided document image and extract the fields:"""
             validated['extraction_notes'] = result['extraction_notes']
         
         return validated
+    
+    def _resize_for_speed(self, image: Image.Image, max_size: int = 480) -> Image.Image:
+        """Resize image for faster VLM inference. Default 480px for CPU target ≤30s."""
+        w, h = image.size
+        if max(w, h) > max_size:
+            scale = max_size / max(w, h)
+            new_w, new_h = int(w * scale), int(h * scale)
+            return image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        return image
     
     def _to_pil(self, image: Union[Image.Image, np.ndarray, str, Path]) -> Image.Image:
         """Convert to PIL Image."""

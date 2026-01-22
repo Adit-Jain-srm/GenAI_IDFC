@@ -90,29 +90,30 @@ class ConsensusEngine:
     #
     FIELD_METHOD_TRUST = {
         'dealer_name': {
-            'rule_based': 1.0,   # Usually printed in header, OCR reliable
-            'vlm': 0.85,         # VLM good but may over-interpret or hallucinate
+            'rule_based': 0.85,  # Fallback for printed headers
+            'vlm': 1.1,          # VLM better at vernacular (Hindi/Gujarati) names
         },
         'model_name': {
-            'rule_based': 0.75,  # Pattern matching limited to known brands
-            'vlm': 1.0,          # VLM better at reading full model with variants
+            'rule_based': 0.7,   # Pattern matching limited to known brands/OCR errors
+            'vlm': 1.15,         # VLM better at reading full model with variants + Hindi numerals
         },
         'horse_power': {
-            'rule_based': 0.5,   # Often handwritten, high OCR noise
-            'vlm': 1.1,          # VLM excels at reading handwritten numbers (boosted)
+            'rule_based': 0.4,   # Often handwritten, high OCR noise
+            'vlm': 1.3,          # VLM strongly preferred for handwritten numbers
         },
         'asset_cost': {
-            'rule_based': 0.4,   # Almost always handwritten, high PIN code risk
-            'vlm': 1.15,         # VLM excels, understands context (PIN vs price) (boosted)
+            'rule_based': 0.35,  # Almost always handwritten, high PIN code confusion risk
+            'vlm': 1.35,         # VLM strongly preferred, understands context (PIN vs price)
         },
     }
     
-    # Document trait adjustments
+    # Document trait adjustments - VLM strongly preferred for handwritten & vernacular
     TRAIT_ADJUSTMENTS = {
-        'has_handwriting': {'rule_based': 0.7, 'vlm': 1.2},
-        'is_hindi': {'rule_based': 0.9, 'vlm': 1.0},
-        'is_gujarati': {'rule_based': 0.85, 'vlm': 1.0},
-        'low_quality': {'rule_based': 0.6, 'vlm': 0.9},
+        'has_handwriting': {'rule_based': 0.5, 'vlm': 1.4},  # VLM strongly preferred
+        'is_hindi': {'rule_based': 0.8, 'vlm': 1.15},        # VLM better at Hindi vernacular
+        'is_gujarati': {'rule_based': 0.75, 'vlm': 1.15},    # VLM better at Gujarati vernacular
+        'low_quality': {'rule_based': 0.5, 'vlm': 1.0},      # VLM more robust to noise
+        'has_stamp_signature_overlap': {'rule_based': 0.6, 'vlm': 1.2},  # VLM handles occlusion better
     }
     
     def __init__(
@@ -159,6 +160,7 @@ class ConsensusEngine:
         - is_hindi: Significant Hindi text present
         - is_gujarati: Significant Gujarati text present
         - low_quality: Poor image/OCR quality
+        - has_stamp_signature_overlap: Stamp/signature likely present and may overlap text
         
         Returns:
             Dict of trait_name -> bool
@@ -168,6 +170,7 @@ class ConsensusEngine:
             'is_hindi': False,
             'is_gujarati': False,
             'low_quality': False,
+            'has_stamp_signature_overlap': True,  # Per problem statement: "all images 'will' contain both stamp and signature - likely overlapping"
         }
         
         full_text = ocr_result.get('full_text', '')
