@@ -1,5 +1,21 @@
 <div align="center">
 
+# GenAI IDFC
+
+**Generative AI Solution for Financial Services**
+
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![GenAI](https://img.shields.io/badge/Generative_AI-LLM-FF6F00)](https://ai.google.dev/)
+[![Hackathon](https://img.shields.io/badge/IDFC_First-Hackathon-blue)](https://www.idfcfirstbank.com/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Last Commit](https://img.shields.io/github/last-commit/Adit-Jain-srm/GenAI_IDFC)](https://github.com/Adit-Jain-srm/GenAI_IDFC)
+
+*AI-powered financial services solution built for the IDFC First Bank GenAI Hackathon.*
+
+</div>
+
+---
+
 # IDFC Tractor Loan Document AI
 
 **Intelligent Document Extraction for Tractor Loan Quotations & Invoices**
